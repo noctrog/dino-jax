@@ -1,0 +1,25 @@
+[project]
+name = "dino"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "albumentationsx>=2.0.9",
+    "datasets>=4.0.0",
+    "dm-pix>=0.4.4",
+    "einops>=0.8.1",
+    "flax>=0.11.1",
+    "grain>=0.2.11",
+    "jax[cuda12]>=0.7.0",
+    "matplotlib>=3.10.5",
+    "opencv-python>=4.12.0.88",
+    "optax>=0.2.5",
+    "orbax>=0.1.9",
+    "seaborn>=0.13.2",
+    "tensorflow>=2.20.0",
+    "tensorflow-datasets>=4.9.9",
+    "tqdm>=4.67.1",
+    "tyro>=0.9.28",
+    "wandb>=0.21.1",
+]
