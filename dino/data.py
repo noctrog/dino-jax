@@ -1,15 +1,7 @@
-from typing import Literal, Dict, Optional, List
-from types import SimpleNamespace
-import platform
+from typing import Literal
 from dataclasses import dataclass
-import warnings
 
-from datasets import load_dataset
-import jax
-import jax.numpy as jnp
-import dm_pix
 import numpy as np
-import dm_pix as pix
 import grain.python as grain
 import tensorflow_datasets as tfds
 import albumentations as A
@@ -22,85 +14,114 @@ IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 @dataclass
 class DataConfig:
-    dataset_name: Literal["imagenet-1k", "timm/imagenet-1k-wds"] = (
-        "timm/imagenet-1k-wds"
-    )
+    num_workers: int = 32
 
     global_crops_scale: tuple[float, float] = (0.4, 1.0)
-    global_crops_size: int = 224
+    global_crops_size: tuple[int, int] = (224, 224)
     local_crops_scale: tuple[float, float] = (0.05, 0.4)
-    local_crops_size: int = 96
+    local_crops_size: tuple[int, int] = (96, 96)
     local_crops_number: int = 8
+    ratio: tuple[float, float] = (3.0 / 4.0, 4.0 / 3.0)
 
     normalization_mean: tuple[float, float, float] = IMAGENET_DEFAULT_MEAN
     normalization_std: tuple[float, float, float] = IMAGENET_DEFAULT_STD
 
 
-class RandomResizedCrop(grain.MapTransform):
+class DINOAugmentations(grain.MapTransform):
     def __init__(
         self,
-        size: tuple[int, int] = (224, 224),
-        scale: tuple[float, float] = (0.08, 1.0),
-        ratio: tuple[float, float] = (3.0 / 4.0, 4.0 / 3.0),
-        interpolation: str = "bicubic",
+        cfg: DataConfig,
     ):
         super().__init__()
-        self.size = size
-        self.scale = scale
-        self.ratio = ratio
-        self.interpolation = interpolation
+        self.local_crops_number = cfg.local_crops_number
 
-    def get_crop_size(self, image: np.ndarray | jax.Array) -> tuple[int, int, int]:
-        height, width, _ = image.shape
-        area = height * width
-        log_ratio = np.log(self.ratio)
+        self.geom_aug_global = A.Compose(
+            [
+                A.ToFloat(),
+                A.RandomResizedCrop(
+                    cfg.global_crops_size,
+                    cfg.global_crops_scale,
+                    cfg.ratio,
+                    interpolation=cv2.INTER_CUBIC,
+                ),
+                A.HorizontalFlip(p=0.5),
+            ]
+        )
+        self.geom_aug_local = A.Compose(
+            [
+                A.ToFloat(),
+                A.RandomResizedCrop(
+                    cfg.local_crops_size,
+                    cfg.local_crops_scale,
+                    cfg.ratio,
+                    interpolation=cv2.INTER_CUBIC,
+                ),
+                A.HorizontalFlip(p=0.5),
+            ]
+        )
+        color_jittering = A.Compose(
+            [
+                A.ColorJitter(
+                    brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8
+                ),
+                A.ToGray(p=0.2),
+            ]
+        )
+        global_transfo1_extra = A.GaussianBlur(
+            blur_limit=23, sigma_limit=(0.1, 2.0), p=1.0
+        )
+        global_transfo2_extra = A.Compose(
+            [
+                A.GaussianBlur(blur_limit=23, sigma_limit=(0.1, 2.0), p=0.1),
+                A.Solarize(threshold_range=(0.5, 0.5), p=0.2),
+            ]
+        )
 
-        for _ in range(10):
-            target_area = area * self.np_rng.uniform(*self.scale)
-            aspect_ratio = np.exp(self.np_rng.uniform(*log_ratio))
-            w = int(round(np.sqrt(target_area * aspect_ratio)))
-            h = int(round(np.sqrt(target_area / aspect_ratio)))
-
-            if 0 < w <= width and 0 < h <= height:
-                return h, w, 3
-
-        # Fallback to center crop
-        in_ratio = float(width) / float(height)
-        if in_ratio < min(self.ratio):
-            w = width
-            h = int(round(w / min(self.ratio)))
-        elif in_ratio > max(self.ratio):
-            h = height
-            w = int(round(h * max(self.ratio)))
-        else:
-            w = width
-            h = height
-        return h, w, 3
+        local_transfo_extra = A.GaussianBlur(
+            blur_limit=23, sigma_limit=(0.1, 2.0), p=0.5
+        )
+        self.normalize = A.Normalize(
+            mean=cfg.normalization_mean, std=cfg.normalization_std
+        )
+        self.global_transfo1 = A.Compose(
+            [color_jittering, global_transfo1_extra, self.normalize]
+        )
+        self.global_transfo2 = A.Compose(
+            [color_jittering, global_transfo2_extra, self.normalize]
+        )
+        self.local_transfo = A.Compose(
+            [color_jittering, local_transfo_extra, self.normalize]
+        )
 
     def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         image = element["image"]
 
-        image = A.RandomResizedCrop(
-            self.size, self.scale, self.ratio, interpolation=cv2.INTER_CUBIC
-        )
-        # image = jnp.asarray(image, dtype=jnp.float32)
-        # crops = self.get_crop_size(image)
-        # image = pix.random_crop(crop_key, image, crops)
-        # image = jax.image.resize(image, self.size, method=self.interpolation)
+        im1_base = self.geom_aug_global(image=image)["image"]
+        global_crop_1 = self.global_transfo1(image=im1_base)["image"]
 
-        element["image"] = image
-        return element
+        im2_base = self.geom_aug_global(image=image)["image"]
+        global_crop_2 = self.global_transfo2(image=im2_base)["image"]
+
+        local_crops = [
+            self.local_transfo(image=self.geom_aug_local(image=image)["image"])["image"]
+            for _ in range(self.local_crops_number)
+        ]
+
+        return {
+            "global_crops": [global_crop_1, global_crop_2],
+            "local_crops": local_crops,
+        }
 
 
 def create_dataloaders(
-    key, batch_size, epochs
+    cfg: DataConfig, batch_size: int, epochs: int
 ) -> tuple[grain.DataLoader, grain.DataLoader, int, int]:
     imagenet = tfds.data_source("imagenet2012", split="train")
     imagenet_val = tfds.data_source("imagenet2012", split="validation")
     train_loader = grain.DataLoader(
         data_source=imagenet,
         operations=[
-            RandomResizedCrop(),
+            DINOAugmentations(cfg),
             grain.Batch(batch_size, drop_remainder=True),
         ],
         sampler=grain.IndexSampler(
@@ -110,8 +131,9 @@ def create_dataloaders(
             shuffle=True,
             seed=0,
         ),
-        worker_count=32,
-        read_options=grain.ReadOptions(num_threads=8, prefetch_buffer_size=500),
+        worker_count=cfg.num_workers,
+        worker_buffer_size=1,
+        read_options=grain.ReadOptions(num_threads=8, prefetch_buffer_size=32),
     )
     val_loader = grain.DataLoader(
         data_source=imagenet_val,
@@ -123,7 +145,7 @@ def create_dataloaders(
             shuffle=False,
             seed=0,
         ),
-        worker_count=0,
+        worker_count=cfg.num_workers,
     )
     return (
         train_loader,
@@ -131,12 +153,3 @@ def create_dataloaders(
         len(imagenet) // batch_size,
         (len(imagenet_val) + batch_size - 1) // batch_size,
     )
-
-
-if __name__ == "__main__":
-    cfg = SimpleNamespace()
-    cfg.epochs = 10
-
-    key = jax.random.PRNGKey(0)
-    train_loader, val_loader = create_dataloaders(key, 32, cfg)
-    image = next(iter(train_loader))

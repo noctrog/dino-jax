@@ -1,10 +1,11 @@
 from typing import Literal, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from itertools import islice
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P, Mesh
+from jax.sharding import PartitionSpec as P, NamedSharding
 import flax.nnx as nnx
 import optax
 from optax.schedules import warmup_cosine_decay_schedule
@@ -12,6 +13,7 @@ from orbax.checkpoint import CheckpointManagerOptions, CheckpointManager
 import numpy as np
 import tyro
 from tqdm import tqdm
+import wandb
 
 from data import DataConfig, create_dataloaders
 from model import SSLConfig, SSLTeacherStudent
@@ -22,15 +24,14 @@ class TrainConfig:
     seed: int = 42
     epochs: int = 100
     batch_size: int = 1024
-    gpu_batch_size: int = 64
+    gpu_batch_size: int = 32
     """The batch size for a singe gpu at a given time (micro_batch // n_gpus)"""
 
     wandb: bool = False
-    checkpoint_every: int | None = None
+    experiment_name: str | None = None
+    checkpoint_every: int = 0
     output_dir: Path = Path("outputs")
-    resum_from: Path | None = None
-
-    num_workers: int = 32
+    restore_from: Path | None = None
 
     adamw_beta1: float = 0.9
     adamw_beta2: float = 0.999
@@ -49,9 +50,9 @@ class TrainConfig:
     student_temp: float = 0.1
     teacher_momentum_start: float = 0.996
     teacher_momentum_end: float = 1.0
-    teacher_warmup_temp: float = 0.04  # NOTE: unused for now
+    # teacher_warmup_temp: float = 0.04  # NOTE: unused for now
     teacher_temp: float = 0.04
-    teacher_temp_warmup_epochs: int = 30
+    # teacher_temp_warmup_epochs: int = 30
 
     data: DataConfig = field(default_factory=lambda: DataConfig())
     ssl: SSLConfig = field(default_factory=lambda: SSLConfig())
@@ -92,6 +93,9 @@ def build_schedules(
 
 
 def main(cfg: TrainConfig):
+    if cfg.wandb:
+        wandb.init(project="dino-jax", name=cfg.experiment_name)
+
     key = jax.random.PRNGKey(cfg.seed)
     rngs = nnx.Rngs(cfg.seed)
 
@@ -100,12 +104,11 @@ def main(cfg: TrainConfig):
     assert cfg.batch_size % (cfg.gpu_batch_size * jax.device_count()) == 0
     grad_acc_steps = int(cfg.batch_size / (cfg.gpu_batch_size * jax.device_count()))
     micro_batch_size = cfg.gpu_batch_size * jax.device_count()
-    print(f"grad_acc_steps: ", grad_acc_steps)
-    print(f"micro_batch_size: ", micro_batch_size)
+    print("grad_acc_steps: ", grad_acc_steps)
+    print("micro_batch_size: ", micro_batch_size)
 
-    data_key, key = jax.random.split(key, 2)
     train_loader, val_loader, train_iters, val_iters = create_dataloaders(
-        data_key, micro_batch_size, cfg.epochs
+        cfg.data, micro_batch_size, cfg.epochs
     )
 
     model = SSLTeacherStudent(cfg.ssl, mesh=mesh, rngs=rngs)
@@ -127,17 +130,53 @@ def main(cfg: TrainConfig):
 
     chain = optax.chain(
         optax.clip_by_global_norm(3.0),
-        optax.adamw(learning_rate=lr_schedule, b1=cfg.adamw_beta1, b2=cfg.adamw_beta2),
+        optax.adamw(
+            learning_rate=lr_schedule,
+            b1=cfg.adamw_beta1,
+            b2=cfg.adamw_beta2,
+            weight_decay=0.04,
+        ),
     )
     optim = nnx.Optimizer(
-        (model.student, model.dino_student_head), chain, wrt=nnx.Param
+        (model.student, model.dino_student_head),
+        optax.MultiSteps(chain, every_k_schedule=grad_acc_steps),
+        wrt=nnx.Param,
     )
 
     # TODO: orbax restore checkpoint
+    if cfg.restore_from is not None and cfg.restore_from.exists():
+        pass
 
+    global_iter = 0
     for epoch in tqdm(range(cfg.epochs), desc="Epoch"):
-        for samples in tqdm(train_loader, total=train_iters, desc="Batch"):
+        train_iter = islice(iter(train_loader), train_iters)
+        for samples in tqdm(train_iter, total=train_iters, desc="Batch"):
+            samples = jax.device_put(
+                samples, NamedSharding(mesh, P("data", None, None, None))
+            )
+            loss = model(
+                optim,
+                samples["global_crops"],
+                samples["local_crops"],
+                student_temp=cfg.student_temp,
+                teacher_temp=cfg.teacher_temp,
+                teacher_ema_mom=mo_schedule(global_iter),
+                update_head=epoch >= cfg.freeze_last_layer_epochs,
+            )
+
+            if global_iter % grad_acc_steps == 0:
+                model.update_teacher(mo_schedule(global_iter))
+                if cfg.wandb:
+                    wandb.log({"loss": loss})
+
+            global_iter += 1
+
+        if cfg.checkpoint_every > 0 and epoch % cfg.checkpoint_every == 0:
             pass
+            # TODO: checkpoint with orbax
+
+    if cfg.wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":

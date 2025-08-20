@@ -1,4 +1,5 @@
 from typing import Tuple
+from functools import partial
 from dataclasses import dataclass, field
 import math
 
@@ -50,13 +51,15 @@ class PatchEmbed(nnx.Module):
             cfg.in_channels * patch_hw[0] * patch_hw[1],
             cfg.embed_dim,
             use_bias=False,
+            kernel_init=nnx.initializers.truncated_normal(0.02),
+            bias_init=nnx.initializers.zeros_init(),
             param_dtype=jnp.float32,
             rngs=rngs,
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         _, H, W, _ = x.shape
-        ph, pw = self.patch_size
+        ph, pw = self.patch_size, self.patch_size
 
         x = rearrange(x, "b (h ph) (w pw) c -> b (h w) (c ph pw)", ph=ph, pw=pw)
         x = self.proj(x)
@@ -65,7 +68,12 @@ class PatchEmbed(nnx.Module):
 
 class MLP(nnx.Module):
     def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
-        linear_kwargs = {"use_bias": False, "param_dtype": jnp.float32}
+        linear_kwargs = {
+            "use_bias": False,
+            "param_dtype": jnp.float32,
+            "kernel_init": nnx.initializers.truncated_normal(0.02),
+            "bias_init": nnx.initializers.zeros_init(),
+        }
         self.up_proj = nnx.Linear(
             cfg.embed_dim, cfg.mlp_hidden_dim, rngs=rngs, **linear_kwargs
         )
@@ -84,7 +92,12 @@ class Attention(nnx.Module):
     def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
         self.num_heads = cfg.num_heads
 
-        linear_kwargs = {"use_bias": False, "param_dtype": jnp.float32}
+        linear_kwargs = {
+            "use_bias": False,
+            "param_dtype": jnp.float32,
+            "kernel_init": nnx.initializers.truncated_normal(0.02),
+            "bias_init": nnx.initializers.zeros_init(),
+        }
         self.qkv_proj = nnx.Linear(
             cfg.embed_dim, 3 * cfg.embed_dim, rngs=rngs, **linear_kwargs
         )
@@ -110,8 +123,18 @@ class TransformerDecoderLayer(nnx.Module):
     def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
         self.attention = Attention(cfg, rngs)
         self.mlp = MLP(cfg, rngs)
-        self.att_norm = nnx.RMSNorm(cfg.embed_dim, rngs=rngs)
-        self.mlp_norm = nnx.RMSNorm(cfg.embed_dim, rngs=rngs)
+        self.att_norm = nnx.LayerNorm(
+            cfg.embed_dim,
+            scale_init=nnx.initializers.ones_init(),
+            bias_init=nnx.initializers.zeros_init(),
+            rngs=rngs,
+        )
+        self.mlp_norm = nnx.LayerNorm(
+            cfg.embed_dim,
+            scale_init=nnx.initializers.ones_init(),
+            bias_init=nnx.initializers.zeros_init(),
+            rngs=rngs,
+        )
 
     def __call__(
         self, x: jax.Array, attention_mask: jax.Array | None = None
@@ -126,21 +149,26 @@ class ViT(nnx.Module):
         self.embed_dim = cfg.embed_dim
         self.patch_embed = PatchEmbed(cfg, rngs)
 
-        default_kernel_init = nnx.initializers.lecun_normal()
+        pos_embed_init = nnx.initializers.normal(stddev=0.02)
+        cls_kernel_init = nnx.initializers.truncated_normal(stddev=1e-6)
         init_key = rngs.params()
-        cls_key, init_key = jax.random.split(init_key)
-        self.cls_token = nnx.Param(default_kernel_init(cls_key, (1, 1, cfg.embed_dim)))
-        pos_key, init_key = jax.random.split(init_key)
+
+        cls_key, pos_key = jax.random.split(init_key)
+        self.cls_token = nnx.Param(cls_kernel_init(cls_key, (1, 1, cfg.embed_dim)))
         self.pos_embed = nnx.Param(
-            default_kernel_init(
-                pos_key, (1, self.patch_embed.num_patches, cfg.embed_dim)
-            )
+            pos_embed_init(pos_key, (1, self.patch_embed.num_patches, cfg.embed_dim))
         )
 
         self.layers = [
             TransformerDecoderLayer(cfg, rngs) for _ in range(cfg.num_layers)
         ]
-        self.norm = nnx.RMSNorm(cfg.embed_dim, epsilon=1e-6, rngs=rngs)
+        self.norm = nnx.LayerNorm(
+            cfg.embed_dim,
+            scale_init=nnx.initializers.ones_init(),
+            bias_init=nnx.initializers.zeros_init(),
+            epsilon=1e-6,
+            rngs=rngs,
+        )
 
     def interpolate_pos_encoding(self, x: jax.Array) -> jax.Array:
         assert x.ndim == 3
@@ -198,7 +226,7 @@ def _build_mlp(
             in_dim,
             bottleneck_dim,
             use_bias=bias,
-            kernel_init=nnx.initializers.truncated_normal(),
+            kernel_init=nnx.initializers.truncated_normal(0.02),
             bias_init=nnx.initializers.zeros_init(),
             rngs=rngs,
         )
@@ -208,7 +236,7 @@ def _build_mlp(
                 in_dim,
                 hidden_dim,
                 use_bias=bias,
-                kernel_init=nnx.initializers.truncated_normal(),
+                kernel_init=nnx.initializers.truncated_normal(0.02),
                 bias_init=nnx.initializers.zeros_init(),
                 rngs=rngs,
             )
@@ -222,7 +250,7 @@ def _build_mlp(
                     hidden_dim,
                     hidden_dim,
                     use_bias=bias,
-                    kernel_init=nnx.initializers.truncated_normal(),
+                    kernel_init=nnx.initializers.truncated_normal(0.02),
                     bias_init=nnx.initializers.zeros_init(),
                     rngs=rngs,
                 )
@@ -266,7 +294,14 @@ class DINOHead(nnx.Module):
             bias=mlp_bias,
             rngs=rngs,
         )
-        self.last_layer = nnx.Linear(bottleneck_dim, out_dim, use_bias=False, rngs=rngs)
+        self.last_layer = nnx.Linear(
+            bottleneck_dim,
+            out_dim,
+            use_bias=False,
+            kernel_init=nnx.initializers.truncated_normal(0.02),
+            bias_init=nnx.initializers.zeros_init(),
+            rngs=rngs,
+        )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = self.mlp(x)
@@ -296,8 +331,8 @@ class DINOLoss(nnx.Module):
 
     def __call__(
         self,
-        student_logits: list[jax.Array],
-        teacher_logits: list[jax.Array],
+        student_logits: jax.Array,
+        teacher_logits: jax.Array,
         student_temp: float,
         teacher_temp: float,
     ) -> tuple[float | jax.Array, jax.Array]:
@@ -343,6 +378,59 @@ class DINOLoss(nnx.Module):
         )
 
 
+@partial(nnx.value_and_grad, argnums=(2, 3), has_aux=True)
+def loss_fn(
+    teacher_vit: ViT,
+    teacher_head: DINOHead,
+    student_vit: ViT,
+    student_head: DINOHead,
+    dino_loss: DINOLoss,
+    global_crops: jax.Array,
+    local_crops: jax.Array,
+    student_temp: float,
+    teacher_temp: float,
+):
+    """Returns the loss and the center update"""
+    teacher_output = teacher_vit(global_crops)
+    teacher_logits = teacher_head(teacher_output["cls"])
+    student_output = student_vit(global_crops + local_crops)
+    student_logits = student_head(student_output["cls"])
+    return dino_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        student_temp=student_temp,
+        teacher_temp=teacher_temp,
+    )
+
+
+@nnx.jit
+def train_step(
+    ssl: "SSLTeacherStudent",
+    optim: nnx.Optimizer,
+    global_crops: jax.Array,
+    local_crops: jax.Array,
+    student_temp: float,
+    teacher_temp: float,
+    update_head: bool,
+) -> tuple[float | jax.Array, jax.Array]:
+    (loss, new_center), grads = loss_fn(
+        ssl.teacher,
+        ssl.dino_teacher_head,
+        ssl.student,
+        ssl.dino_student_head,
+        ssl.dino_loss,
+        global_crops=global_crops,
+        local_crops=local_crops,
+        student_temp=student_temp,
+        teacher_temp=teacher_temp,
+    )
+    if not update_head:
+        grads[1] = jax.tree.map(lambda x: jnp.zeros_like(x), grads[1])
+
+    optim.update((ssl.student, ssl.dino_student_head), grads)
+    return loss, new_center
+
+
 class SSLTeacherStudent(nnx.Module):
     def __init__(self, cfg: SSLConfig, mesh: jax.sharding.Mesh, rngs: nnx.Rngs):
         self.cfg = cfg
@@ -376,28 +464,23 @@ class SSLTeacherStudent(nnx.Module):
         local_crops: list[jax.Array],
         student_temp: float,
         teacher_temp: float,
+        teacher_ema_mom: float,
+        update_head: bool = True,
     ) -> tuple[float | jax.Array, nnx.GraphState]:
-        teacher_output = self.teacher(global_crops)
-        teacher_logits = self.dino_teacher_head(teacher_output["cls"])  # (B, N, C)
-
-        def loss_fn(vit: ViT, head: DINOHead, teacher_logits: jax.Array):
-            student_output = vit(global_crops + local_crops)
-            student_logits = head(student_output["cls"])
-            return self.dino_loss(
-                student_logits=student_logits,
-                teacher_logits=teacher_logits,
-                student_temp=student_temp,
-                teacher_temp=teacher_temp,
-            )
-
-        grad_fn = nnx.value_and_grad(loss_fn, argnums=(0, 1), has_aux=True)
-        (loss, new_center), grads = grad_fn(
-            self.student, self.dino_student_head, teacher_logits
+        loss, new_center = train_step(
+            self,
+            optim,
+            global_crops=global_crops,
+            local_crops=local_crops,
+            student_temp=student_temp,
+            teacher_temp=teacher_temp,
+            update_head=update_head,
         )
         self.dino_loss.center = new_center
-        optim.update([self.student, self.dino_student_head], grads)
-        return loss, grads
+        self.update_teacher(teacher_ema_mom)
+        return loss
 
+    @nnx.jit
     def update_teacher(self, momentum: float) -> None:
         new_teacher_state = jax.tree.map(
             lambda t, s: t * momentum + s * (1 - momentum),
@@ -412,31 +495,3 @@ class SSLTeacherStudent(nnx.Module):
 
         nnx.update(self.teacher, new_teacher_state)
         nnx.update(self.dino_teacher_head, new_teacher_head_state)
-
-
-if __name__ == "__main__":
-    from jax.sharding import PartitionSpec as P, NamedSharding
-    import optax
-
-    mesh = jax.make_mesh((2,), ("data",))
-    input = [jnp.ones((32, 224, 224, 3)), jnp.ones((32, 96, 96, 3))]
-    input = jax.tree.map(
-        lambda x: jax.device_put(x, NamedSharding(mesh, P("data", None, None, None))),
-        input,
-    )
-    rngs = nnx.Rngs(0)
-
-    ssl = SSLTeacherStudent(SSLConfig(), mesh=mesh, rngs=rngs)
-    optim = nnx.Optimizer(
-        (ssl.student, ssl.dino_student_head), optax.adamw(3e-4, 0.9), wrt=nnx.Param
-    )
-
-    @nnx.jit
-    def step(ssl, optim, input1, input2):
-        return ssl(optim, input1, input2, 1.0, 1.0)
-
-    loss, grads = step(ssl, optim, input, input)
-    # jax.debug.visualize_array_sharding(input[0][:, :, 0, 0])
-    # jax.debug.visualize_array_sharding(jax.tree.leaves(grads)[2])
-    print("loss: ", loss)
-    ssl.update_teacher(0.9)
