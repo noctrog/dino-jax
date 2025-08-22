@@ -37,7 +37,6 @@ class DINOAugmentations(grain.MapTransform):
 
         self.geom_aug_global = A.Compose(
             [
-                A.ToFloat(),
                 A.RandomResizedCrop(
                     cfg.global_crops_size,
                     cfg.global_crops_scale,
@@ -49,7 +48,6 @@ class DINOAugmentations(grain.MapTransform):
         )
         self.geom_aug_local = A.Compose(
             [
-                A.ToFloat(),
                 A.RandomResizedCrop(
                     cfg.local_crops_size,
                     cfg.local_crops_scale,
@@ -132,7 +130,6 @@ def create_dataloaders(
             seed=0,
         ),
         worker_count=cfg.num_workers,
-        worker_buffer_size=1,
         read_options=grain.ReadOptions(num_threads=8, prefetch_buffer_size=32),
     )
     val_loader = grain.DataLoader(

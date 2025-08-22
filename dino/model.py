@@ -21,6 +21,9 @@ class ViTConfig:
     mlp_hidden_dim: int = 1536
     num_heads: int = 6
 
+    selective: bool = False
+    """If True, checkpoint the attention computations for the backward pass."""
+
 
 @dataclass
 class SSLDinoConfig:
@@ -70,6 +73,7 @@ class MLP(nnx.Module):
     def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
         linear_kwargs = {
             "use_bias": False,
+            "dtype": jnp.bfloat16,
             "param_dtype": jnp.float32,
             "kernel_init": nnx.initializers.truncated_normal(0.02),
             "bias_init": nnx.initializers.zeros_init(),
@@ -85,15 +89,23 @@ class MLP(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        return self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        x = x.astype(jnp.bfloat16)
+        x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return x.astype(jnp.float32)
 
 
 class Attention(nnx.Module):
     def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
         self.num_heads = cfg.num_heads
+        self.attn_fn = (
+            jax.checkpoint(jax.nn.dot_product_attention)
+            if cfg.selective
+            else jax.nn.dot_product_attention
+        )
 
         linear_kwargs = {
             "use_bias": False,
+            "dtype": jnp.bfloat16,
             "param_dtype": jnp.float32,
             "kernel_init": nnx.initializers.truncated_normal(0.02),
             "bias_init": nnx.initializers.zeros_init(),
@@ -108,14 +120,16 @@ class Attention(nnx.Module):
     def __call__(
         self, x: jax.Array, attention_mask: jax.Array | None = None
     ) -> jax.Array:
+        x = x.astype(jnp.bfloat16)
         q, k, v = jnp.split(self.qkv_proj(x), 3, axis=-1)
 
         q = rearrange(q, "b t (n c) -> b t n c", n=self.num_heads)
         k = rearrange(k, "b t (n c) -> b t n c", n=self.num_heads)
         v = rearrange(v, "b t (n c) -> b t n c", n=self.num_heads)
-        att = jax.nn.dot_product_attention(q, k, v, mask=attention_mask)
+        att = self.attn_fn(q, k, v, mask=attention_mask)
         att = rearrange(att, "b t n c -> b t (n c)")
         att = self.o_proj(att)
+        att = att.astype(jnp.float32)
         return att
 
 
@@ -180,9 +194,14 @@ class ViT(nnx.Module):
         if x.shape[1] == self.pos_embed.shape[1]:
             return self.pos_embed
 
-        pos_embed_2d = rearrange(self.pos_embed, "b (h w) d -> b h w d", h=hw_posemb)
+        pos_embed_2d = rearrange(
+            self.pos_embed.value, "b (h w) d -> b h w d", h=hw_posemb
+        )
         pos_embed_resized = jax.image.resize(
-            pos_embed_2d, shape=(hw, hw), method="bilinear", antialias=False
+            pos_embed_2d,
+            shape=(1, hw, hw, self.embed_dim),
+            method="bilinear",
+            antialias=False,
         )
         return rearrange(pos_embed_resized, "b h w d -> b (h w) d")
 
@@ -190,12 +209,15 @@ class ViT(nnx.Module):
         """Forward pass of the ViT.
 
         Args:
-          x (jax.Array): the input tensor of shape BHWD.
+          x (jax.Array | list[jax.Array]): the input tensor of shape BHWD.
         """
         bs = x.shape[0] if isinstance(x, jax.Array) else x[0].shape[0]
         tokens = jax.tree.map(self.patch_embed, x)
+        pos_embeds = jax.tree.map(self.interpolate_pos_encoding, tokens)
         cls_token = jnp.broadcast_to(self.cls_token, (bs, 1, self.embed_dim))
-        tokens = jax.tree.map(lambda x: jnp.concatenate((cls_token, x), axis=1), tokens)
+        tokens = jax.tree.map(
+            lambda x, p: jnp.concatenate((cls_token, x + p), axis=1), tokens, pos_embeds
+        )
         lens = jax.tree.map(lambda x: x.shape[1], tokens)
         ones = jax.tree.map(
             lambda x: jnp.ones((x.shape[1], x.shape[1]), dtype=jnp.bool_), tokens
@@ -228,6 +250,8 @@ def _build_mlp(
             use_bias=bias,
             kernel_init=nnx.initializers.truncated_normal(0.02),
             bias_init=nnx.initializers.zeros_init(),
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.float32,
             rngs=rngs,
         )
     else:
@@ -238,6 +262,8 @@ def _build_mlp(
                 use_bias=bias,
                 kernel_init=nnx.initializers.truncated_normal(0.02),
                 bias_init=nnx.initializers.zeros_init(),
+                dtype=jnp.bfloat16,
+                param_dtype=jnp.float32,
                 rngs=rngs,
             )
         ]
@@ -252,6 +278,8 @@ def _build_mlp(
                     use_bias=bias,
                     kernel_init=nnx.initializers.truncated_normal(0.02),
                     bias_init=nnx.initializers.zeros_init(),
+                    dtype=jnp.bfloat16,
+                    param_dtype=jnp.float32,
                     rngs=rngs,
                 )
             )
@@ -265,6 +293,8 @@ def _build_mlp(
                 kernel_init=nnx.initializers.truncated_normal(),
                 bias_init=nnx.initializers.zeros_init(),
                 use_bias=bias,
+                dtype=jnp.bfloat16,
+                param_dtype=jnp.float32,
                 rngs=rngs,
             )
         )
@@ -304,7 +334,8 @@ class DINOHead(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = self.mlp(x)
+        x = x.astype(jnp.bfloat16)
+        x = self.mlp(x).astype(jnp.float32)
         eps = 1e-12 if x.dtype == jnp.float32 else 1e-6
         norm = jnp.linalg.norm(x, ord=2, axis=-1, keepdims=True)
         x = x / jnp.maximum(norm, eps)
@@ -322,7 +353,7 @@ class DINOLoss(nnx.Module):
         self, out_dim: int, center_momentum: float = 0.9, *, mesh: jax.sharding.Mesh
     ):
         self.center_momentum = center_momentum
-        self.center = nnx.Variable(jnp.zeros((1, 1, out_dim)))
+        self.center = nnx.Variable(jnp.zeros((1, out_dim)))
         self.updated = True
         self.reduce_handle = None
         self.len_teacher_output = None
@@ -403,7 +434,7 @@ def loss_fn(
     )
 
 
-@nnx.jit
+@partial(nnx.jit, static_argnames=("update_head",))
 def train_step(
     ssl: "SSLTeacherStudent",
     optim: nnx.Optimizer,
@@ -425,7 +456,10 @@ def train_step(
         teacher_temp=teacher_temp,
     )
     if not update_head:
-        grads[1] = jax.tree.map(lambda x: jnp.zeros_like(x), grads[1])
+        new_state = jax.tree.map(
+            jnp.zeros_like, nnx.state(grads, nnx.PathContains("last_layer"))
+        )
+        nnx.update(grads, new_state)
 
     optim.update((ssl.student, ssl.dino_student_head), grads)
     return loss, new_center
@@ -476,8 +510,7 @@ class SSLTeacherStudent(nnx.Module):
             teacher_temp=teacher_temp,
             update_head=update_head,
         )
-        self.dino_loss.center = new_center
-        self.update_teacher(teacher_ema_mom)
+        self.dino_loss.center.value = new_center
         return loss
 
     @nnx.jit

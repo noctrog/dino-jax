@@ -9,7 +9,7 @@ from jax.sharding import PartitionSpec as P, NamedSharding
 import flax.nnx as nnx
 import optax
 from optax.schedules import warmup_cosine_decay_schedule
-from orbax.checkpoint import CheckpointManagerOptions, CheckpointManager
+import orbax.checkpoint as ocp
 import numpy as np
 import tyro
 from tqdm import tqdm
@@ -24,14 +24,13 @@ class TrainConfig:
     seed: int = 42
     epochs: int = 100
     batch_size: int = 1024
-    gpu_batch_size: int = 32
+    gpu_batch_size: int = 128
     """The batch size for a singe gpu at a given time (micro_batch // n_gpus)"""
 
     wandb: bool = False
     experiment_name: str | None = None
     checkpoint_every: int = 0
-    output_dir: Path = Path("outputs")
-    restore_from: Path | None = None
+    restore: bool = False
 
     adamw_beta1: float = 0.9
     adamw_beta2: float = 0.999
@@ -75,9 +74,10 @@ def build_schedules(
     cfg: TrainConfig, samples_per_epoch: int
 ) -> tuple[Callable, Callable, Callable]:
     total_steps = cfg.epochs * samples_per_epoch
+    lr_base_scaled = cfg.lr_base * (cfg.batch_size / 256.0)
     lr_schedule = warmup_cosine_decay_schedule(
         init_value=cfg.lr_final,
-        peak_value=cfg.lr_base,
+        peak_value=lr_base_scaled,
         warmup_steps=cfg.lr_warmup_epochs * samples_per_epoch,
         decay_steps=total_steps,
         end_value=cfg.lr_final,
@@ -96,7 +96,6 @@ def main(cfg: TrainConfig):
     if cfg.wandb:
         wandb.init(project="dino-jax", name=cfg.experiment_name)
 
-    key = jax.random.PRNGKey(cfg.seed)
     rngs = nnx.Rngs(cfg.seed)
 
     mesh = jax.make_mesh((jax.device_count(),), ("data",))
@@ -134,18 +133,31 @@ def main(cfg: TrainConfig):
             learning_rate=lr_schedule,
             b1=cfg.adamw_beta1,
             b2=cfg.adamw_beta2,
-            weight_decay=0.04,
+            weight_decay=cfg.weight_decay_start,  # TODO: how to make schedule?
         ),
     )
     optim = nnx.Optimizer(
         (model.student, model.dino_student_head),
-        optax.MultiSteps(chain, every_k_schedule=grad_acc_steps),
+        optax.MultiSteps(chain, every_k_schedule=grad_acc_steps)
+        if grad_acc_steps > 1
+        else chain,
         wrt=nnx.Param,
     )
 
-    # TODO: orbax restore checkpoint
-    if cfg.restore_from is not None and cfg.restore_from.exists():
-        pass
+    if cfg.checkpoint_every > 0:
+        opts = ocp.CheckpointManagerOptions(save_interval_steps=cfg.checkpoint_every)
+    else:
+        opts = ocp.CheckpointManagerOptions(read_only=True)
+    mngr = ocp.CheckpointManager(
+        wandb.run.dir if cfg.wandb else Path("outputs"),
+        options=opts,
+        item_names=("state", "optim"),
+    )
+    if cfg.restore:
+        step = mngr.latest_step()
+        restored_state, restored_optim_state = mngr.restore(step)
+        nnx.update(model, restored_state)
+        nnx.update(optim, restored_optim_state)
 
     global_iter = 0
     for epoch in tqdm(range(cfg.epochs), desc="Epoch"):
@@ -167,13 +179,18 @@ def main(cfg: TrainConfig):
             if global_iter % grad_acc_steps == 0:
                 model.update_teacher(mo_schedule(global_iter))
                 if cfg.wandb:
-                    wandb.log({"loss": loss})
+                    wandb.log({"loss": loss, "lr": lr_schedule(global_iter)})
 
             global_iter += 1
 
-        if cfg.checkpoint_every > 0 and epoch % cfg.checkpoint_every == 0:
-            pass
-            # TODO: checkpoint with orbax
+        mngr.save(
+            epoch,
+            args=ocp.args.Composite(
+                state=ocp.args.StandardSave(nnx.state(model)),
+                optim=ocp.args.StandardSave(nnx.state(optim)),
+            ),
+        )
+        mngr.wait_until_finished()
 
     if cfg.wandb:
         wandb.finish()
