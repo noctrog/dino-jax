@@ -1,5 +1,9 @@
 from typing import Literal
 from dataclasses import dataclass
+import os
+
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+os.environ["ALBUMENTATIONS_NO_TELEMETRY"] = "1"
 
 import numpy as np
 import grain.python as grain
@@ -111,15 +115,35 @@ class DINOAugmentations(grain.MapTransform):
         }
 
 
+class DINOValidationAugmentations(grain.MapTransform):
+    def __init__(self, cfg: DataConfig):
+        self.transforms = A.Compose(
+            [
+                A.Resize(256, 256),
+                A.CenterCrop(224, 224),
+                A.Normalize(cfg.normalization_mean, cfg.normalization_std),
+            ]
+        )
+
+    def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        element["image"] = self.transforms(image=element["image"])["image"]
+        return element
+
+
 def create_dataloaders(
-    cfg: DataConfig, batch_size: int, epochs: int
+    cfg: DataConfig,
+    batch_size: int,
+    epochs: int,
+    train_augmentations: bool = True,
 ) -> tuple[grain.DataLoader, grain.DataLoader, int, int]:
     imagenet = tfds.data_source("imagenet2012", split="train")
     imagenet_val = tfds.data_source("imagenet2012", split="validation")
     train_loader = grain.DataLoader(
         data_source=imagenet,
         operations=[
-            DINOAugmentations(cfg),
+            DINOAugmentations(cfg)
+            if train_augmentations
+            else DINOValidationAugmentations(cfg),
             grain.Batch(batch_size, drop_remainder=True),
         ],
         sampler=grain.IndexSampler(
@@ -134,7 +158,10 @@ def create_dataloaders(
     )
     val_loader = grain.DataLoader(
         data_source=imagenet_val,
-        operations=[grain.Batch(batch_size, drop_remainder=False)],
+        operations=[
+            DINOValidationAugmentations(cfg),
+            grain.Batch(batch_size, drop_remainder=False),
+        ],
         sampler=grain.IndexSampler(
             num_records=len(imagenet_val),
             num_epochs=1,

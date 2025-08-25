@@ -1,5 +1,5 @@
 from typing import Literal, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from itertools import islice
 
@@ -16,7 +16,7 @@ from tqdm import tqdm
 import wandb
 
 from data import DataConfig, create_dataloaders
-from model import SSLConfig, SSLTeacherStudent
+from model import SSLConfig, SSLTeacherStudent, SSLDinoConfig, ViTConfig
 
 
 @dataclass
@@ -55,6 +55,17 @@ class TrainConfig:
 
     data: DataConfig = field(default_factory=lambda: DataConfig())
     ssl: SSLConfig = field(default_factory=lambda: SSLConfig())
+
+
+def config_from_dict(d: dict) -> TrainConfig:
+    data = DataConfig(**d["data"])
+    dino = SSLDinoConfig(**d["ssl"]["dino"])
+    vit = ViTConfig(**d["ssl"]["vit"])
+    ssl = SSLConfig(dino=dino, vit=vit)
+
+    # Handle the top-level fields, excluding the nested ones
+    top_level = {k: v for k, v in d.items() if k not in ["data", "ssl"]}
+    return TrainConfig(**top_level, data=data, ssl=ssl)
 
 
 def cosine_scheduler(start: float, end: float, num_iter: int) -> Callable:
@@ -151,13 +162,23 @@ def main(cfg: TrainConfig):
     mngr = ocp.CheckpointManager(
         wandb.run.dir if cfg.wandb else Path("outputs"),
         options=opts,
-        item_names=("state", "optim"),
+        item_names=("state", "optim", "config"),
     )
+    # TODO: this is incorrect? the model is not initialized with the train config
     if cfg.restore:
         step = mngr.latest_step()
-        restored_state, restored_optim_state = mngr.restore(step)
-        nnx.update(model, restored_state)
-        nnx.update(optim, restored_optim_state)
+        restored = mngr.restore(
+            step,
+            args=ocp.args.Composite(
+                state=ocp.args.StandardRestore(nnx.state(model)),
+                optim=ocp.args.StandardRestore(nnx.state(optim)),
+                config=ocp.args.JsonRestore(),
+            ),
+        )
+        # restored_state, restored_optim_state = mngr.restore(step)
+        nnx.update(model, restored["state"])
+        nnx.update(optim, restored["optim"])
+        cfg = config_from_dict(restored["config"])
 
     global_iter = 0
     for epoch in tqdm(range(cfg.epochs), desc="Epoch"):
@@ -188,10 +209,12 @@ def main(cfg: TrainConfig):
             args=ocp.args.Composite(
                 state=ocp.args.StandardSave(nnx.state(model)),
                 optim=ocp.args.StandardSave(nnx.state(optim)),
+                config=ocp.args.JsonSave(asdict(cfg)),
             ),
         )
         mngr.wait_until_finished()
 
+    mngr.close()
     if cfg.wandb:
         wandb.finish()
 

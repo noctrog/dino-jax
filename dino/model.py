@@ -218,7 +218,7 @@ class ViT(nnx.Module):
         tokens = jax.tree.map(
             lambda x, p: jnp.concatenate((cls_token, x + p), axis=1), tokens, pos_embeds
         )
-        lens = jax.tree.map(lambda x: x.shape[1], tokens)
+        lens = jax.tree.leaves(jax.tree.map(lambda x: x.shape[1], tokens))
         ones = jax.tree.map(
             lambda x: jnp.ones((x.shape[1], x.shape[1]), dtype=jnp.bool_), tokens
         )
@@ -229,7 +229,9 @@ class ViT(nnx.Module):
             tokens = block(tokens, attention_mask=attn_mask)
 
         tokens = self.norm(tokens)
-        starts = jnp.concatenate((jnp.array([0]), jnp.cumsum(jnp.array(lens[:-1]))))
+        starts = jnp.concatenate(
+            (jnp.array([0]), jnp.cumsum(jnp.array(lens[:-1], dtype=jnp.int32)))
+        )
         return {"cls": tokens[:, starts, :]}
 
 
@@ -350,7 +352,11 @@ class DINOHead(nnx.Module):
 
 class DINOLoss(nnx.Module):
     def __init__(
-        self, out_dim: int, center_momentum: float = 0.9, *, mesh: jax.sharding.Mesh
+        self,
+        out_dim: int,
+        center_momentum: float = 0.9,
+        *,
+        mesh: jax.sharding.Mesh | None,
     ):
         self.center_momentum = center_momentum
         self.center = nnx.Variable(jnp.zeros((1, out_dim)))
@@ -466,7 +472,7 @@ def train_step(
 
 
 class SSLTeacherStudent(nnx.Module):
-    def __init__(self, cfg: SSLConfig, mesh: jax.sharding.Mesh, rngs: nnx.Rngs):
+    def __init__(self, cfg: SSLConfig, mesh: jax.sharding.Mesh | None, rngs: nnx.Rngs):
         self.cfg = cfg
         self.student = ViT(cfg=cfg.vit, rngs=rngs)
         self.teacher = ViT(cfg=cfg.vit, rngs=rngs)
