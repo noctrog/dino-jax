@@ -81,16 +81,13 @@ class MLP(nnx.Module):
         self.up_proj = nnx.Linear(
             cfg.embed_dim, cfg.mlp_hidden_dim, rngs=rngs, **linear_kwargs
         )
-        self.gate_proj = nnx.Linear(
-            cfg.embed_dim, cfg.mlp_hidden_dim, rngs=rngs, **linear_kwargs
-        )
         self.down_proj = nnx.Linear(
             cfg.mlp_hidden_dim, cfg.embed_dim, rngs=rngs, **linear_kwargs
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = x.astype(jnp.bfloat16)
-        x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        x = self.down_proj(jax.nn.gelu(self.up_proj(x)))
         return x.astype(jnp.float32)
 
 
@@ -141,12 +138,14 @@ class TransformerDecoderLayer(nnx.Module):
             cfg.embed_dim,
             scale_init=nnx.initializers.ones_init(),
             bias_init=nnx.initializers.zeros_init(),
+            epsilon=1e-6,
             rngs=rngs,
         )
         self.mlp_norm = nnx.LayerNorm(
             cfg.embed_dim,
             scale_init=nnx.initializers.ones_init(),
             bias_init=nnx.initializers.zeros_init(),
+            epsilon=1e-6,
             rngs=rngs,
         )
 

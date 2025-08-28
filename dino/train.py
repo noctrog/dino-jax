@@ -51,15 +51,14 @@ class TrainConfig:
     weight_decay_end: float = 0.4
     clip_grad: float = 3.0
     freeze_last_layer_epochs: int = 1
-    layerwise_decay: float = 0.9
     patch_embed_lr_mult: float = 0.2
 
     student_temp: float = 0.1
     teacher_momentum_start: float = 0.996
     teacher_momentum_end: float = 1.0
-    # teacher_warmup_temp: float = 0.04  # NOTE: unused for now
-    teacher_temp: float = 0.04
-    # teacher_temp_warmup_epochs: int = 30
+    teacher_temp_start: float = 0.04
+    teacher_temp_end: float = 0.07
+    teacher_temp_warmup_epochs: int = 30
 
     data: DataConfig = field(default_factory=lambda: DataConfig())
     ssl: SSLConfig = field(default_factory=lambda: SSLConfig())
@@ -89,9 +88,20 @@ def cosine_scheduler(start: float, end: float, num_iter: int) -> Callable:
     return interpolate
 
 
+def cosine_scheduler_jax(start: float, end: float, num_iter: int) -> Callable:
+    def interpolate_jax(i: int) -> jax.Array:
+        progress = i / num_iter
+
+        cosine_value = end + (start - end) * 0.5 * (1 + jnp.cos(jnp.pi * progress))
+        value = jnp.where(i < 0, start, jnp.where(i < num_iter, cosine_value, end))
+        return value
+
+    return interpolate_jax
+
+
 def build_schedules(
     cfg: TrainConfig, samples_per_epoch: int
-) -> tuple[Callable, Callable, Callable]:
+) -> tuple[Callable, Callable, Callable, Callable]:
     total_steps = cfg.epochs * samples_per_epoch
     lr_base_scaled = cfg.lr_base * (cfg.batch_size / 256.0)
     lr_schedule = warmup_cosine_decay_schedule(
@@ -101,14 +111,19 @@ def build_schedules(
         decay_steps=total_steps,
         end_value=cfg.lr_final,
     )
-    wd_schedule = cosine_scheduler(
+    wd_schedule = cosine_scheduler_jax(
         cfg.weight_decay_start, cfg.weight_decay_end, total_steps
     )
     mo_schedule = cosine_scheduler(
         cfg.teacher_momentum_start, cfg.teacher_momentum_end, total_steps
     )
+    tt_schedule = cosine_scheduler(
+        cfg.teacher_temp_start,
+        cfg.teacher_temp_end,
+        cfg.teacher_temp_warmup_epochs * samples_per_epoch,
+    )
 
-    return lr_schedule, wd_schedule, mo_schedule
+    return lr_schedule, wd_schedule, mo_schedule, tt_schedule
 
 
 def main(cfg: TrainConfig):
@@ -144,15 +159,28 @@ def main(cfg: TrainConfig):
     print(f"ViT backbone: {param_count / 1_000_000:.2f}M params")
     print(f"ViT head: {head_param_count / 1_000_000:.2f}M params")
 
-    lr_schedule, wd_schedule, mo_schedule = build_schedules(cfg, train_iters)
+    lr_schedule, wd_schedule, mo_schedule, tt_schedule = build_schedules(
+        cfg, train_iters
+    )
 
+    def mask_fn(path, param):
+        if param in ["pos_embed", "cls_token"]:
+            return False
+        elif param.value.ndim != 2:
+            return False
+        return True
+
+    wd_mask = nnx.map_state(
+        mask_fn, nnx.state((model.student, model.dino_student_head))
+    )
     chain = optax.chain(
         optax.clip_by_global_norm(3.0),
-        optax.adamw(
+        optax.inject_hyperparams(optax.adamw)(
             learning_rate=lr_schedule,
             b1=cfg.adamw_beta1,
             b2=cfg.adamw_beta2,
-            weight_decay=cfg.weight_decay_start,  # TODO: how to make schedule?
+            weight_decay=wd_schedule,
+            mask=wd_mask,
         ),
     )
     optim = nnx.Optimizer(
@@ -200,7 +228,7 @@ def main(cfg: TrainConfig):
                 samples["global_crops"],
                 samples["local_crops"],
                 student_temp=cfg.student_temp,
-                teacher_temp=cfg.teacher_temp,
+                teacher_temp=tt_schedule(global_iter),
                 teacher_ema_mom=mo_schedule(global_iter),
                 update_head=epoch >= cfg.freeze_last_layer_epochs,
             )
@@ -208,7 +236,15 @@ def main(cfg: TrainConfig):
             if global_iter % grad_acc_steps == 0:
                 model.update_teacher(mo_schedule(global_iter))
                 if cfg.wandb:
-                    wandb.log({"loss": loss, "lr": lr_schedule(global_iter)})
+                    wandb.log(
+                        {
+                            "loss": loss,
+                            "lr": lr_schedule(global_iter),
+                            "wd": wd_schedule(global_iter),
+                            "teacher_momentum": mo_schedule(global_iter),
+                            "teacher_temp": tt_schedule(global_iter),
+                        }
+                    )
 
             global_iter += 1
 
