@@ -19,7 +19,6 @@ IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 @dataclass
 class DataConfig:
     num_workers: int = 32
-    in_memory: bool = False
 
     global_crops_scale: tuple[float, float] = (0.4, 1.0)
     global_crops_size: tuple[int, int] = (224, 224)
@@ -139,10 +138,6 @@ def create_dataloaders(
 ) -> tuple[grain.DataLoader, grain.DataLoader, int, int]:
     imagenet = tfds.data_source("imagenet2012", split="train")
     imagenet_val = tfds.data_source("imagenet2012", split="validation")
-
-    if cfg.in_memory:
-        imagenet = grain.InMemoryDataSource(imagenet)
-        imagenet_val = grain.InMemoryDataSource(imagenet_val)
 
     train_loader = grain.DataLoader(
         data_source=imagenet,

@@ -212,17 +212,17 @@ def main(cfg: Config):
     )
     del vit
 
-    top_1, top_5 = knn_classifier(
-        train_features,
-        train_labels,
-        val_features,
-        val_labels,
-        k=10,
-        temperature=1.0,
-    )
+    for k in cfg.nb_knn:
+        top_1, top_5 = knn_classifier(
+            train_features,
+            train_labels,
+            val_features,
+            val_labels,
+            k=k,
+            temperature=1.0,
+        )
 
-    print("top_1: ", top_1)
-    print("top_5: ", top_5)
+        print(f"K: {k}\ttop_1: {top_1}\ttop_5: {top_5}")
 
 
 if __name__ == "__main__":
