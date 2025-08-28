@@ -163,8 +163,8 @@ class ViT(nnx.Module):
         self.embed_dim = cfg.embed_dim
         self.patch_embed = PatchEmbed(cfg, rngs)
 
-        pos_embed_init = nnx.initializers.normal(stddev=0.02)
-        cls_kernel_init = nnx.initializers.truncated_normal(stddev=1e-6)
+        pos_embed_init = nnx.initializers.truncated_normal(0.02)
+        cls_kernel_init = nnx.initializers.normal(1e-6)
         init_key = rngs.params()
 
         cls_key, pos_key = jax.random.split(init_key)
@@ -292,7 +292,7 @@ def _build_mlp(
             nnx.Linear(
                 hidden_dim,
                 bottleneck_dim,
-                kernel_init=nnx.initializers.truncated_normal(),
+                kernel_init=nnx.initializers.truncated_normal(0.02),
                 bias_init=nnx.initializers.zeros_init(),
                 use_bias=bias,
                 dtype=jnp.bfloat16,
