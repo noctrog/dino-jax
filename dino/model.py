@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Literal
 from functools import partial
 from dataclasses import dataclass, field
 import math
@@ -25,6 +25,14 @@ class ViTConfig:
     """If True, checkpoint the attention computations for the backward pass."""
 
 
+VIT_CONFIGS = {
+    "vitt": ViTConfig(embed_dim=192, num_layers=12, mlp_hidden_dim=768, num_heads=3),
+    "vits": ViTConfig(embed_dim=384, num_layers=12, mlp_hidden_dim=1536, num_heads=6),
+    "vitb": ViTConfig(embed_dim=768, num_layers=12, mlp_hidden_dim=3072, num_heads=12),
+    "vitl": ViTConfig(embed_dim=1024, num_layers=24, mlp_hidden_dim=4096, num_heads=16),
+}
+
+
 @dataclass
 class SSLDinoConfig:
     weight: float = 1.0
@@ -37,7 +45,11 @@ class SSLDinoConfig:
 @dataclass
 class SSLConfig:
     dino: SSLDinoConfig = field(default_factory=lambda: SSLDinoConfig())
-    vit: ViTConfig = field(default_factory=lambda: ViTConfig())
+    vit_model: Literal["vitt", "vits", "vitb", "vitl"] = "vits"
+
+    @property
+    def vit(self) -> ViTConfig:
+        return VIT_CONFIGS[self.vit_model]
 
 
 class PatchEmbed(nnx.Module):
