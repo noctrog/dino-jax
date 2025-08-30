@@ -1,5 +1,6 @@
 from typing import Literal
 from dataclasses import dataclass
+import platform
 import os
 
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
@@ -136,8 +137,16 @@ def create_dataloaders(
     epochs: int,
     train_augmentations: bool = True,
 ) -> tuple[grain.DataLoader, grain.DataLoader, int, int]:
-    imagenet = tfds.data_source("imagenet2012", split="train")
-    imagenet_val = tfds.data_source("imagenet2012", split="validation")
+    scratch_path = "/scratch/tensorflow_datasets"
+    using_scratch = "gpu" in platform.node() and os.path.exists(scratch_path)
+    imagenet = tfds.data_source(
+        "imagenet2012", split="train", data_dir=scratch_path if using_scratch else None
+    )
+    imagenet_val = tfds.data_source(
+        "imagenet2012",
+        split="validation",
+        data_dir=scratch_path if using_scratch else None,
+    )
 
     train_loader = grain.DataLoader(
         data_source=imagenet,

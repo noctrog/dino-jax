@@ -45,13 +45,12 @@ class TrainConfig:
 
     scaling_rule: Literal["sqrt_wrt_256", "sqrt_wrt_1024"] = "sqrt_wrt_256"
     lr_base: float = 0.0005
-    lr_final: float = 1e-6
+    lr_final: float = 1e-5
     lr_warmup_epochs: int = 10
     weight_decay_start: float = 0.04
     weight_decay_end: float = 0.4
     clip_grad: float = 3.0
     freeze_last_layer_epochs: int = 1
-    patch_embed_lr_mult: float = 0.2
 
     student_temp: float = 0.1
     teacher_momentum_start: float = 0.996
@@ -130,7 +129,7 @@ def main(cfg: TrainConfig):
     if cfg.wandb:
         wandb.init(project="dino-jax", name=cfg.experiment_name)
 
-    rngs = nnx.Rngs(cfg.seed)
+    rngs = nnx.Rngs(params=cfg.seed, dropout=cfg.seed + 1)
 
     mesh = jax.make_mesh((jax.device_count(),), ("data",))
 
@@ -145,17 +144,11 @@ def main(cfg: TrainConfig):
     )
 
     model = SSLTeacherStudent(cfg.ssl, mesh=mesh, rngs=rngs)
-    param_count = sum(
-        jax.tree.map(
-            lambda x: jnp.size(x), jax.tree.leaves(nnx.state(model.student, nnx.Param))
-        )
-    )
-    head_param_count = sum(
-        jax.tree.map(
-            lambda x: jnp.size(x),
-            jax.tree.leaves(nnx.state(model.dino_student_head, nnx.Param)),
-        )
-    )
+    model.train()
+    student_params = jax.tree.leaves(nnx.state(model.student, nnx.Param))
+    param_count = sum(jax.tree.map(lambda x: jnp.size(x), student_params))
+    head_params = jax.tree.leaves(nnx.state(model.dino_student_head, nnx.Param))
+    head_param_count = sum(jax.tree.map(lambda x: jnp.size(x), head_params))
     print(f"ViT backbone: {param_count / 1_000_000:.2f}M params")
     print(f"ViT head: {head_param_count / 1_000_000:.2f}M params")
 
@@ -171,7 +164,7 @@ def main(cfg: TrainConfig):
         return True
 
     wd_mask = nnx.map_state(
-        mask_fn, nnx.state((model.student, model.dino_student_head))
+        mask_fn, nnx.state((model.student, model.dino_student_head), nnx.Param)
     )
     chain = optax.chain(
         optax.clip_by_global_norm(3.0),
@@ -183,12 +176,10 @@ def main(cfg: TrainConfig):
             mask=wd_mask,
         ),
     )
+    if grad_acc_steps > 1:
+        chain = optax.MultiSteps(chain, every_k_schedule=grad_acc_steps)
     optim = nnx.Optimizer(
-        (model.student, model.dino_student_head),
-        optax.MultiSteps(chain, every_k_schedule=grad_acc_steps)
-        if grad_acc_steps > 1
-        else chain,
-        wrt=nnx.Param,
+        (model.student, model.dino_student_head), chain, wrt=nnx.Param
     )
 
     if cfg.checkpoint_every > 0:
@@ -230,7 +221,7 @@ def main(cfg: TrainConfig):
                 student_temp=cfg.student_temp,
                 teacher_temp=tt_schedule(global_iter),
                 teacher_ema_mom=mo_schedule(global_iter),
-                update_head=epoch >= cfg.freeze_last_layer_epochs,
+                update_last_layer=epoch >= cfg.freeze_last_layer_epochs,
             )
 
             if global_iter % grad_acc_steps == 0:

@@ -219,7 +219,7 @@ def main(cfg: Config):
             val_features,
             val_labels,
             k=k,
-            temperature=1.0,
+            temperature=cfg.temperature,
         )
 
         print(f"K: {k}\ttop_1: {top_1}\ttop_5: {top_5}")

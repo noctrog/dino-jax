@@ -16,20 +16,26 @@ class ViTConfig:
     patch_size: int = 16
     in_channels: int = 3
 
-    embed_dim: int = 384
-    num_layers: int = 12
-    mlp_hidden_dim: int = 1536
-    num_heads: int = 6
+    configuration: Literal["vitt", "vits", "vitb", "vitl"] = "vits"
+
+    drop_rate: float = 0.1
 
     selective: bool = False
     """If True, checkpoint the attention computations for the backward pass."""
 
+    def __post_init__(self):
+        config = VIT_CONFIGS[self.configuration]
+        self.embed_dim = config["embed_dim"]
+        self.num_layers = config["num_layers"]
+        self.mlp_hidden_dim = config["hidden_dim"]
+        self.num_heads = config["num_heads"]
+
 
 VIT_CONFIGS = {
-    "vitt": ViTConfig(embed_dim=192, num_layers=12, mlp_hidden_dim=768, num_heads=3),
-    "vits": ViTConfig(embed_dim=384, num_layers=12, mlp_hidden_dim=1536, num_heads=6),
-    "vitb": ViTConfig(embed_dim=768, num_layers=12, mlp_hidden_dim=3072, num_heads=12),
-    "vitl": ViTConfig(embed_dim=1024, num_layers=24, mlp_hidden_dim=4096, num_heads=16),
+    "vitt": {"embed_dim": 192, "num_layers": 12, "hidden_dim": 768, "num_heads": 3},
+    "vits": {"embed_dim": 384, "num_layers": 12, "hidden_dim": 1536, "num_heads": 6},
+    "vitb": {"embed_dim": 768, "num_layers": 12, "hidden_dim": 3072, "num_heads": 12},
+    "vitl": {"embed_dim": 1024, "num_layers": 24, "hidden_dim": 4096, "num_heads": 16},
 }
 
 
@@ -40,16 +46,42 @@ class SSLDinoConfig:
     head_bottleneck: int = 256
     head_nlayers: int = 3
     head_hidden_dim: int = 2048
+    norm_last_layer: bool = True
+    """If True, the g term (scale) of the weight norm of the last layer will not be trained.
+    This increases stability but hinders accuracy. It can be disabled to train ViT-T, ViT-S.
+    """
 
 
 @dataclass
 class SSLConfig:
     dino: SSLDinoConfig = field(default_factory=lambda: SSLDinoConfig())
-    vit_model: Literal["vitt", "vits", "vitb", "vitl"] = "vits"
+    vit: ViTConfig = field(default_factory=lambda: ViTConfig())
 
-    @property
-    def vit(self) -> ViTConfig:
-        return VIT_CONFIGS[self.vit_model]
+
+class DropPath(nnx.Module):
+    def __init__(
+        self,
+        drop_prob: float,
+        deterministic: bool = False,
+        rng_collection: str = "dropout",
+        *,
+        rngs: nnx.Rngs,
+    ):
+        self.drop_prob = drop_prob
+        self.deterministic = deterministic
+        self.rng_collection = "dropout"
+        self.rngs = rngs[self.rng_collection].fork()
+
+    def __call__(self, x: jax.Array, deterministic: bool | None = None):
+        det = deterministic if deterministic is not None else self.deterministic
+        if self.drop_prob == 0.0 or det:
+            return x
+        else:
+            keep_prob = 1 - self.drop_prob
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            mask = jax.random.bernoulli(self.rngs(), p=keep_prob, shape=shape)
+            mask = jnp.broadcast_to(mask, x.shape)
+            return jax.lax.select(mask, x / keep_prob, jnp.zeros_like(x))
 
 
 class PatchEmbed(nnx.Module):
@@ -82,7 +114,7 @@ class PatchEmbed(nnx.Module):
 
 
 class MLP(nnx.Module):
-    def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
         linear_kwargs = {
             "use_bias": False,
             "dtype": jnp.bfloat16,
@@ -104,7 +136,7 @@ class MLP(nnx.Module):
 
 
 class Attention(nnx.Module):
-    def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
         self.num_heads = cfg.num_heads
         self.attn_fn = (
             jax.checkpoint(jax.nn.dot_product_attention)
@@ -143,9 +175,10 @@ class Attention(nnx.Module):
 
 
 class TransformerDecoderLayer(nnx.Module):
-    def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
-        self.attention = Attention(cfg, rngs)
-        self.mlp = MLP(cfg, rngs)
+    def __init__(self, cfg: ViTConfig, drop_prob: float, *, rngs: nnx.Rngs):
+        self.attention = Attention(cfg, rngs=rngs)
+        self.drop_path = DropPath(drop_prob, rngs=rngs)
+        self.mlp = MLP(cfg, rngs=rngs)
         self.att_norm = nnx.LayerNorm(
             cfg.embed_dim,
             scale_init=nnx.initializers.ones_init(),
@@ -162,10 +195,13 @@ class TransformerDecoderLayer(nnx.Module):
         )
 
     def __call__(
-        self, x: jax.Array, attention_mask: jax.Array | None = None
+        self,
+        x: jax.Array,
+        attention_mask: jax.Array | None = None,
     ) -> jax.Array:
-        x = x + self.attention(self.att_norm(x), attention_mask)
-        x = x + self.mlp(self.mlp_norm(x))
+        attn = self.attention(self.att_norm(x), attention_mask)
+        x = x + self.drop_path(attn)
+        x = x + self.drop_path(self.mlp(self.mlp_norm(x)))
         return x
 
 
@@ -175,17 +211,21 @@ class ViT(nnx.Module):
         self.patch_embed = PatchEmbed(cfg, rngs)
 
         pos_embed_init = nnx.initializers.truncated_normal(0.02)
-        cls_kernel_init = nnx.initializers.normal(1e-6)
+        cls_kernel_init = nnx.initializers.truncated_normal(0.02)
         init_key = rngs.params()
 
         cls_key, pos_key = jax.random.split(init_key)
         self.cls_token = nnx.Param(cls_kernel_init(cls_key, (1, 1, cfg.embed_dim)))
         self.pos_embed = nnx.Param(
-            pos_embed_init(pos_key, (1, self.patch_embed.num_patches, cfg.embed_dim))
+            pos_embed_init(
+                pos_key, (1, self.patch_embed.num_patches + 1, cfg.embed_dim)
+            )
         )
 
+        drp = [i * cfg.drop_rate / (cfg.num_layers - 1) for i in range(cfg.num_layers)]
         self.layers = [
-            TransformerDecoderLayer(cfg, rngs) for _ in range(cfg.num_layers)
+            TransformerDecoderLayer(cfg, drp[i], rngs=rngs)
+            for i in range(cfg.num_layers)
         ]
         self.norm = nnx.LayerNorm(
             cfg.embed_dim,
@@ -199,14 +239,14 @@ class ViT(nnx.Module):
         assert x.ndim == 3
         hw = math.isqrt(x.shape[1])
         assert hw**2 == x.shape[1]
-        hw_posemb = math.isqrt(self.pos_embed.shape[1])
-        assert hw_posemb**2 == self.pos_embed.shape[1]
+        hw_posemb = math.isqrt(self.pos_embed.shape[1] - 1)
+        assert hw_posemb**2 == self.pos_embed.shape[1] - 1
 
-        if x.shape[1] == self.pos_embed.shape[1]:
-            return self.pos_embed
+        if x.shape[1] == self.pos_embed.shape[1] - 1:
+            return self.pos_embed[:, 1:]
 
         pos_embed_2d = rearrange(
-            self.pos_embed.value, "b (h w) d -> b h w d", h=hw_posemb
+            self.pos_embed[:, 1:], "b (h w) d -> b h w d", h=hw_posemb
         )
         pos_embed_resized = jax.image.resize(
             pos_embed_2d,
@@ -225,7 +265,9 @@ class ViT(nnx.Module):
         bs = x.shape[0] if isinstance(x, jax.Array) else x[0].shape[0]
         tokens = jax.tree.map(self.patch_embed, x)
         pos_embeds = jax.tree.map(self.interpolate_pos_encoding, tokens)
-        cls_token = jnp.broadcast_to(self.cls_token, (bs, 1, self.embed_dim))
+        cls_token = jnp.broadcast_to(
+            self.cls_token + self.pos_embed[:, 0], (bs, 1, self.embed_dim)
+        )
         tokens = jax.tree.map(
             lambda x, p: jnp.concatenate((cls_token, x + p), axis=1), tokens, pos_embeds
         )
@@ -325,9 +367,11 @@ class DINOHead(nnx.Module):
         hidden_dim: int = 2048,
         bottleneck_dim: int = 256,
         mlp_bias: bool = True,
+        norm_last_layer: bool = False,
         rngs: nnx.Rngs,
     ):
         num_layers = max(num_layers, 1)
+        self.norm_last_layer = norm_last_layer
         self.mlp = _build_mlp(
             num_layers,
             in_dim,
@@ -337,13 +381,12 @@ class DINOHead(nnx.Module):
             bias=mlp_bias,
             rngs=rngs,
         )
-        self.last_layer = nnx.Linear(
-            bottleneck_dim,
-            out_dim,
-            use_bias=False,
-            kernel_init=nnx.initializers.truncated_normal(0.02),
-            bias_init=nnx.initializers.zeros_init(),
-            rngs=rngs,
+
+        self.norm_g = nnx.Param(jnp.ones((1, out_dim))) if not norm_last_layer else None
+        self.last_layer = nnx.Param(
+            nnx.initializers.truncated_normal(0.02)(
+                rngs.params(), (bottleneck_dim, out_dim)
+            )
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -353,11 +396,12 @@ class DINOHead(nnx.Module):
         norm = jnp.linalg.norm(x, ord=2, axis=-1, keepdims=True)
         x = x / jnp.maximum(norm, eps)
 
-        kernel = self.last_layer.kernel
-        kernel_norm = jnp.linalg.norm(kernel, ord=2, axis=0, keepdims=True)
-        normalized_kernel = kernel / jnp.maximum(kernel_norm, eps)
-
-        x = x @ normalized_kernel
+        # Weight Normalization of the last layer
+        v_norm = jnp.linalg.norm(self.last_layer, ord=2, axis=1, keepdims=True)
+        w = self.last_layer / jnp.maximum(v_norm, eps)
+        if not self.norm_last_layer:
+            w = w * self.norm_g
+        x = x @ w
         return x
 
 
@@ -451,7 +495,7 @@ def loss_fn(
     )
 
 
-@partial(nnx.jit, static_argnames=("update_head",))
+@partial(nnx.jit, static_argnames=("update_last_layer",))
 def train_step(
     ssl: "SSLTeacherStudent",
     optim: nnx.Optimizer,
@@ -459,7 +503,7 @@ def train_step(
     local_crops: jax.Array,
     student_temp: float,
     teacher_temp: float,
-    update_head: bool,
+    update_last_layer: bool,
 ) -> tuple[float | jax.Array, jax.Array]:
     (loss, new_center), grads = loss_fn(
         ssl.teacher,
@@ -472,9 +516,13 @@ def train_step(
         student_temp=student_temp,
         teacher_temp=teacher_temp,
     )
-    if not update_head:
+    if not update_last_layer:
         new_state = jax.tree.map(
-            jnp.zeros_like, nnx.state(grads, nnx.PathContains("last_layer"))
+            jnp.zeros_like,
+            nnx.state(
+                grads,
+                nnx.Any(nnx.PathContains("last_layer"), nnx.PathContains("norm_g")),
+            ),
         )
         nnx.update(grads, new_state)
 
@@ -493,6 +541,7 @@ class SSLTeacherStudent(nnx.Module):
             hidden_dim=cfg.dino.head_hidden_dim,
             bottleneck_dim=cfg.dino.head_bottleneck,
             num_layers=cfg.dino.head_nlayers,
+            norm_last_layer=cfg.dino.norm_last_layer,
             rngs=rngs,
         )
         self.dino_teacher_head = DINOHead(
@@ -501,6 +550,7 @@ class SSLTeacherStudent(nnx.Module):
             hidden_dim=cfg.dino.head_hidden_dim,
             bottleneck_dim=cfg.dino.head_bottleneck,
             num_layers=cfg.dino.head_nlayers,
+            norm_last_layer=cfg.dino.norm_last_layer,
             rngs=rngs,
         )
         self.dino_loss = DINOLoss(cfg.dino.head_n_prototypes, mesh=mesh)
@@ -516,7 +566,7 @@ class SSLTeacherStudent(nnx.Module):
         student_temp: float,
         teacher_temp: float,
         teacher_ema_mom: float,
-        update_head: bool = True,
+        update_last_layer: bool = True,
     ) -> tuple[float | jax.Array, nnx.GraphState]:
         loss, new_center = train_step(
             self,
@@ -525,7 +575,7 @@ class SSLTeacherStudent(nnx.Module):
             local_crops=local_crops,
             student_temp=student_temp,
             teacher_temp=teacher_temp,
-            update_head=update_head,
+            update_last_layer=update_last_layer,
         )
         self.dino_loss.center.value = new_center
         return loss
@@ -534,13 +584,13 @@ class SSLTeacherStudent(nnx.Module):
     def update_teacher(self, momentum: float) -> None:
         new_teacher_state = jax.tree.map(
             lambda t, s: t * momentum + s * (1 - momentum),
-            nnx.state(self.teacher),
-            nnx.state(self.student),
+            nnx.state(self.teacher, nnx.Param),
+            nnx.state(self.student, nnx.Param),
         )
         new_teacher_head_state = jax.tree.map(
             lambda t, s: t * momentum + s * (1 - momentum),
-            nnx.state(self.dino_teacher_head),
-            nnx.state(self.dino_student_head),
+            nnx.state(self.dino_teacher_head, nnx.Param),
+            nnx.state(self.dino_student_head, nnx.Param),
         )
 
         nnx.update(self.teacher, new_teacher_state)
