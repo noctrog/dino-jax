@@ -361,7 +361,7 @@ class DINOHead(nnx.Module):
             rngs=rngs,
         )
 
-        self.norm_g = nnx.Param(jnp.ones((1, bottleneck_dim))) if not norm_last_layer else None
+        self.norm_g = nnx.Param(jnp.ones((1, out_dim))) if not norm_last_layer else None
         self.last_layer = nnx.Param(
             nnx.initializers.truncated_normal(0.02)(rngs.params(), (bottleneck_dim, out_dim))
         )
