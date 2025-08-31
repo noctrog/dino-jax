@@ -256,12 +256,12 @@ def main(cfg: Config):
                 samples["local_crops"],
                 student_temp=cfg.train.student_temp,
                 teacher_temp=tt_schedule(global_iter),
-                teacher_ema_mom=mo_schedule(global_iter),
                 update_last_layer=epoch >= cfg.train.freeze_last_layer_epochs,
             )
 
             if global_iter % grad_acc_steps == 0:
                 model.update_teacher(mo_schedule(global_iter))
+
                 if cfg.wandb and global_iter % (grad_acc_steps * cfg.wandb_frequency) == 0:
                     wandb.log(
                         {

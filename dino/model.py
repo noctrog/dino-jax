@@ -18,7 +18,7 @@ class ViTConfig:
 
     configuration: Literal["vitt", "vits", "vitb", "vitl"] = "vits"
 
-    drop_rate: float = 0.1
+    drop_rate: float = 0.0
 
     selective: bool = False
     """If True, checkpoint the attention computations for the backward pass."""
@@ -350,7 +350,6 @@ class DINOHead(nnx.Module):
         rngs: nnx.Rngs,
     ):
         num_layers = max(num_layers, 1)
-        self.norm_last_layer = norm_last_layer
         self.mlp = _build_mlp(
             num_layers,
             in_dim,
@@ -376,7 +375,7 @@ class DINOHead(nnx.Module):
         # Weight Normalization of the last layer
         v_norm = jnp.linalg.norm(self.last_layer, ord=2, axis=0, keepdims=True)
         w = self.last_layer / jnp.maximum(v_norm, eps)
-        if not self.norm_last_layer:
+        if self.norm_g is not None:
             w = w * self.norm_g
         x = x @ w
         return x
@@ -540,7 +539,6 @@ class SSLTeacherStudent(nnx.Module):
         local_crops: list[jax.Array],
         student_temp: float,
         teacher_temp: float,
-        teacher_ema_mom: float,
         update_last_layer: bool = True,
     ) -> tuple[float | jax.Array, nnx.GraphState]:
         loss, new_center = train_step(
@@ -557,16 +555,9 @@ class SSLTeacherStudent(nnx.Module):
 
     @nnx.jit
     def update_teacher(self, momentum: float) -> None:
-        new_teacher_state = jax.tree.map(
+        new_state = jax.tree.map(
             lambda t, s: t * momentum + s * (1 - momentum),
-            nnx.state(self.teacher, nnx.Param),
-            nnx.state(self.student, nnx.Param),
+            nnx.state((self.teacher, self.dino_teacher_head), nnx.Param),
+            nnx.state((self.student, self.dino_student_head), nnx.Param),
         )
-        new_teacher_head_state = jax.tree.map(
-            lambda t, s: t * momentum + s * (1 - momentum),
-            nnx.state(self.dino_teacher_head, nnx.Param),
-            nnx.state(self.dino_student_head, nnx.Param),
-        )
-
-        nnx.update(self.teacher, new_teacher_state)
-        nnx.update(self.dino_teacher_head, new_teacher_head_state)
+        nnx.update((self.teacher, self.dino_teacher_head), new_state)
