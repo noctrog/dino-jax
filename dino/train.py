@@ -11,7 +11,8 @@ import flax.nnx as nnx
 import optax
 from optax.schedules import warmup_cosine_decay_schedule
 import orbax.checkpoint as ocp
-from orbax.checkpoint.args import PyTreeRestore, PyTreeSave, JsonSave, JsonRestore
+from orbax.checkpoint.args import PyTreeRestore, PyTreeSave, JsonSave, JsonRestore, Composite
+from grain.python import PyGrainCheckpointSave, PyGrainCheckpointRestore, DataLoader
 import numpy as np
 import tyro
 from tqdm import tqdm
@@ -161,16 +162,17 @@ def create_optimizer(
 def restore_checkpoint(
     ckpt_path: Path,
     cfg: Config,
+    loader: DataLoader,
     train_iters: int,
     grad_acc_steps: int,
     mesh: jax.sharding.Mesh | None,
-) -> tuple[SSLTeacherStudent, nnx.Optimizer]:
+) -> tuple[SSLTeacherStudent, nnx.Optimizer, DataLoader]:
     """Loads and returns a model and optimizer checkpoint. It also
     modifies the `train`, `data` and `ssl` fields of the config inplace.
     """
     mngr = ocp.CheckpointManager(
         os.path.abspath(ckpt_path),
-        item_names=("state", "optim", "config"),
+        item_names=("state", "optim", "loader", "config"),
         options=ocp.CheckpointManagerOptions(read_only=True),
     )
 
@@ -180,7 +182,7 @@ def restore_checkpoint(
     print(f"Found checkpoint at step {step}. Restoring...")
 
     # Restore model
-    cfg_ckpt = mngr.restore(step, args=ocp.args.Composite(config=JsonRestore()))["config"]
+    cfg_ckpt = mngr.restore(step, args=Composite(config=JsonRestore()))["config"]
     cfg_ckpt["ssl"]["vit"] = {
         k: v
         for k, v in cfg_ckpt["ssl"]["vit"].items()
@@ -196,15 +198,18 @@ def restore_checkpoint(
 
     ssl = nnx.eval_shape(lambda: SSLTeacherStudent(ssl_ckpt, mesh=mesh, rngs=nnx.Rngs(0)))
     graphdef, state = nnx.split(ssl)
-    state = mngr.restore(step, args=ocp.args.Composite(state=PyTreeRestore(state)))["state"]
+    state = mngr.restore(step, args=Composite(state=PyTreeRestore(state)))["state"]
     ssl = nnx.merge(graphdef, state)
 
     # Restore optimizer
     optim = create_optimizer(ssl, cfg.train, train_iters, grad_acc_steps)
-    opt_state = mngr.restore(step, args=ocp.args.Composite(optim=PyTreeRestore(nnx.state(optim))))
+    opt_state = mngr.restore(step, args=Composite(optim=PyTreeRestore(nnx.state(optim))))
     nnx.update(optim, opt_state["optim"])
 
-    return ssl, optim
+    # Restore dataloader state
+    loader = mngr.restore(step, args=Composite(loader=PyGrainCheckpointRestore(loader)))["loader"]
+
+    return ssl, optim, loader
 
 
 def main(cfg: Config):
@@ -221,12 +226,14 @@ def main(cfg: Config):
     print("grad_acc_steps: ", grad_acc_steps)
     print("micro_batch_size: ", micro_batch_size)
 
-    train_loader, val_loader, train_iters, val_iters = create_dataloaders(
+    train_loader, _, train_iters, _ = create_dataloaders(
         cfg.data, micro_batch_size, cfg.train.epochs
     )
 
     if cfg.restore is not None:
-        model, optim = restore_checkpoint(cfg.restore, cfg, train_iters, grad_acc_steps, mesh=mesh)
+        model, optim, train_loader = restore_checkpoint(
+            cfg.restore, cfg, train_loader, train_iters, grad_acc_steps, mesh=mesh
+        )
     else:
         model = SSLTeacherStudent(cfg.ssl, mesh=mesh, rngs=rngs)
         optim = create_optimizer(model, cfg.train, train_iters, grad_acc_steps)
@@ -245,46 +252,49 @@ def main(cfg: Config):
     ckpt_path = os.path.abspath(wandb.run.dir if cfg.wandb else Path("outputs"))
     mngr = ocp.CheckpointManager(ckpt_path, options=opts, item_names=("state", "optim", "config"))
 
+    epoch = 0
     global_iter = 0
-    for epoch in tqdm(range(cfg.train.epochs), desc="Epoch"):
-        train_iter = islice(iter(train_loader), train_iters)
-        for samples in tqdm(train_iter, total=train_iters, desc="Batch"):
-            samples = jax.device_put(samples, NamedSharding(mesh, P("data", None, None, None)))
-            loss = model(
-                optim,
-                samples["global_crops"],
-                samples["local_crops"],
-                student_temp=cfg.train.student_temp,
-                teacher_temp=tt_schedule(global_iter),
-                update_last_layer=epoch >= cfg.train.freeze_last_layer_epochs,
-            )
-
-            if global_iter % grad_acc_steps == 0:
-                model.update_teacher(mo_schedule(global_iter))
-
-                if cfg.wandb and global_iter % (grad_acc_steps * cfg.wandb_frequency) == 0:
-                    wandb.log(
-                        {
-                            "iter": global_iter,
-                            "loss": loss,
-                            "lr": lr_schedule(global_iter),
-                            "wd": wd_schedule(global_iter),
-                            "teacher_momentum": mo_schedule(global_iter),
-                            "teacher_temp": tt_schedule(global_iter),
-                        }
-                    )
-
-            global_iter += 1
-
-        mngr.save(
-            epoch,
-            args=ocp.args.Composite(
-                state=PyTreeSave(nnx.state(model)),
-                optim=PyTreeSave(nnx.state(optim)),
-                config=JsonSave(asdict(cfg)),
-            ),
+    for samples in tqdm(train_loader, total=train_iters * cfg.train.epochs, desc="Step"):
+        samples = jax.device_put(samples, NamedSharding(mesh, P("data", None, None, None)))
+        loss = model(
+            optim,
+            samples["global_crops"],
+            samples["local_crops"],
+            student_temp=cfg.train.student_temp,
+            teacher_temp=tt_schedule(global_iter),
+            update_last_layer=epoch >= cfg.train.freeze_last_layer_epochs,
         )
-        mngr.wait_until_finished()
+
+        if global_iter % grad_acc_steps == 0:
+            model.update_teacher(mo_schedule(global_iter))
+
+            if cfg.wandb and global_iter % (grad_acc_steps * cfg.wandb_frequency) == 0:
+                wandb.log(
+                    {
+                        "iter": global_iter,
+                        "loss": loss,
+                        "lr": lr_schedule(global_iter),
+                        "wd": wd_schedule(global_iter),
+                        "teacher_momentum": mo_schedule(global_iter),
+                        "teacher_temp": tt_schedule(global_iter),
+                    }
+                )
+
+        global_iter += 1
+
+        if global_iter % train_iters == 0:
+            epoch += 1
+            if cfg.checkpoint:
+                mngr.save(
+                    epoch,
+                    args=Composite(
+                        state=PyTreeSave(nnx.state(model)),
+                        optim=PyTreeSave(nnx.state(optim)),
+                        loader=PyGrainCheckpointSave(train_loader),
+                        config=JsonSave(asdict(cfg)),
+                    ),
+                )
+                mngr.wait_until_finished()
 
     mngr.close()
     if cfg.wandb:
