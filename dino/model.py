@@ -87,9 +87,7 @@ class DropPath(nnx.Module):
 class PatchEmbed(nnx.Module):
     def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
         image_hw = [cfg.img_size] * 2 if isinstance(cfg.img_size, int) else cfg.img_size
-        patch_hw = (
-            [cfg.patch_size] * 2 if isinstance(cfg.patch_size, int) else cfg.patch_size
-        )
+        patch_hw = [cfg.patch_size] * 2 if isinstance(cfg.patch_size, int) else cfg.patch_size
         grid_size = [image_hw[0] // patch_hw[0], image_hw[1] // patch_hw[1]]
 
         self.patch_size = cfg.patch_size
@@ -122,12 +120,8 @@ class MLP(nnx.Module):
             "kernel_init": nnx.initializers.truncated_normal(0.02),
             "bias_init": nnx.initializers.zeros_init(),
         }
-        self.up_proj = nnx.Linear(
-            cfg.embed_dim, cfg.mlp_hidden_dim, rngs=rngs, **linear_kwargs
-        )
-        self.down_proj = nnx.Linear(
-            cfg.mlp_hidden_dim, cfg.embed_dim, rngs=rngs, **linear_kwargs
-        )
+        self.up_proj = nnx.Linear(cfg.embed_dim, cfg.mlp_hidden_dim, rngs=rngs, **linear_kwargs)
+        self.down_proj = nnx.Linear(cfg.mlp_hidden_dim, cfg.embed_dim, rngs=rngs, **linear_kwargs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = x.astype(jnp.bfloat16)
@@ -151,16 +145,10 @@ class Attention(nnx.Module):
             "kernel_init": nnx.initializers.truncated_normal(0.02),
             "bias_init": nnx.initializers.zeros_init(),
         }
-        self.qkv_proj = nnx.Linear(
-            cfg.embed_dim, 3 * cfg.embed_dim, rngs=rngs, **linear_kwargs
-        )
-        self.o_proj = nnx.Linear(
-            cfg.embed_dim, cfg.embed_dim, rngs=rngs, **linear_kwargs
-        )
+        self.qkv_proj = nnx.Linear(cfg.embed_dim, 3 * cfg.embed_dim, rngs=rngs, **linear_kwargs)
+        self.o_proj = nnx.Linear(cfg.embed_dim, cfg.embed_dim, rngs=rngs, **linear_kwargs)
 
-    def __call__(
-        self, x: jax.Array, attention_mask: jax.Array | None = None
-    ) -> jax.Array:
+    def __call__(self, x: jax.Array, attention_mask: jax.Array | None = None) -> jax.Array:
         x = x.astype(jnp.bfloat16)
         q, k, v = jnp.split(self.qkv_proj(x), 3, axis=-1)
 
@@ -217,15 +205,12 @@ class ViT(nnx.Module):
         cls_key, pos_key = jax.random.split(init_key)
         self.cls_token = nnx.Param(cls_kernel_init(cls_key, (1, 1, cfg.embed_dim)))
         self.pos_embed = nnx.Param(
-            pos_embed_init(
-                pos_key, (1, self.patch_embed.num_patches + 1, cfg.embed_dim)
-            )
+            pos_embed_init(pos_key, (1, self.patch_embed.num_patches + 1, cfg.embed_dim))
         )
 
         drp = [i * cfg.drop_rate / (cfg.num_layers - 1) for i in range(cfg.num_layers)]
         self.layers = [
-            TransformerDecoderLayer(cfg, drp[i], rngs=rngs)
-            for i in range(cfg.num_layers)
+            TransformerDecoderLayer(cfg, drp[i], rngs=rngs) for i in range(cfg.num_layers)
         ]
         self.norm = nnx.LayerNorm(
             cfg.embed_dim,
@@ -245,9 +230,7 @@ class ViT(nnx.Module):
         if x.shape[1] == self.pos_embed.shape[1] - 1:
             return self.pos_embed[:, 1:]
 
-        pos_embed_2d = rearrange(
-            self.pos_embed[:, 1:], "b (h w) d -> b h w d", h=hw_posemb
-        )
+        pos_embed_2d = rearrange(self.pos_embed[:, 1:], "b (h w) d -> b h w d", h=hw_posemb)
         pos_embed_resized = jax.image.resize(
             pos_embed_2d,
             shape=(1, hw, hw, self.embed_dim),
@@ -265,16 +248,12 @@ class ViT(nnx.Module):
         bs = x.shape[0] if isinstance(x, jax.Array) else x[0].shape[0]
         tokens = jax.tree.map(self.patch_embed, x)
         pos_embeds = jax.tree.map(self.interpolate_pos_encoding, tokens)
-        cls_token = jnp.broadcast_to(
-            self.cls_token + self.pos_embed[:, 0], (bs, 1, self.embed_dim)
-        )
+        cls_token = jnp.broadcast_to(self.cls_token + self.pos_embed[:, 0], (bs, 1, self.embed_dim))
         tokens = jax.tree.map(
             lambda x, p: jnp.concatenate((cls_token, x + p), axis=1), tokens, pos_embeds
         )
         lens = jax.tree.leaves(jax.tree.map(lambda x: x.shape[1], tokens))
-        ones = jax.tree.map(
-            lambda x: jnp.ones((x.shape[1], x.shape[1]), dtype=jnp.bool_), tokens
-        )
+        ones = jax.tree.map(lambda x: jnp.ones((x.shape[1], x.shape[1]), dtype=jnp.bool_), tokens)
         tokens = jnp.concatenate(jax.tree.leaves(tokens), axis=1)
         attn_mask = jax.scipy.linalg.block_diag(*jax.tree.leaves(ones))
 
@@ -384,9 +363,7 @@ class DINOHead(nnx.Module):
 
         self.norm_g = nnx.Param(jnp.ones((1, out_dim))) if not norm_last_layer else None
         self.last_layer = nnx.Param(
-            nnx.initializers.truncated_normal(0.02)(
-                rngs.params(), (bottleneck_dim, out_dim)
-            )
+            nnx.initializers.truncated_normal(0.02)(rngs.params(), (bottleneck_dim, out_dim))
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -397,7 +374,7 @@ class DINOHead(nnx.Module):
         x = x / jnp.maximum(norm, eps)
 
         # Weight Normalization of the last layer
-        v_norm = jnp.linalg.norm(self.last_layer, ord=2, axis=1, keepdims=True)
+        v_norm = jnp.linalg.norm(self.last_layer, ord=2, axis=0, keepdims=True)
         w = self.last_layer / jnp.maximum(v_norm, eps)
         if not self.norm_last_layer:
             w = w * self.norm_g
@@ -465,9 +442,7 @@ class DINOLoss(nnx.Module):
 
         global_center = sharded_compute(teacher_output)
 
-        return self.center * self.center_momentum + global_center * (
-            1 - self.center_momentum
-        )
+        return self.center * self.center_momentum + global_center * (1 - self.center_momentum)
 
 
 @partial(nnx.value_and_grad, argnums=(2, 3), has_aux=True)

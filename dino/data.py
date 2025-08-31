@@ -64,15 +64,11 @@ class DINOAugmentations(grain.MapTransform):
         )
         color_jittering = A.Compose(
             [
-                A.ColorJitter(
-                    brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8
-                ),
+                A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
                 A.ToGray(p=0.2),
             ]
         )
-        global_transfo1_extra = A.GaussianBlur(
-            blur_limit=23, sigma_limit=(0.1, 2.0), p=1.0
-        )
+        global_transfo1_extra = A.GaussianBlur(blur_limit=23, sigma_limit=(0.1, 2.0), p=1.0)
         global_transfo2_extra = A.Compose(
             [
                 A.GaussianBlur(blur_limit=23, sigma_limit=(0.1, 2.0), p=0.1),
@@ -80,21 +76,11 @@ class DINOAugmentations(grain.MapTransform):
             ]
         )
 
-        local_transfo_extra = A.GaussianBlur(
-            blur_limit=23, sigma_limit=(0.1, 2.0), p=0.5
-        )
-        self.normalize = A.Normalize(
-            mean=cfg.normalization_mean, std=cfg.normalization_std
-        )
-        self.global_transfo1 = A.Compose(
-            [color_jittering, global_transfo1_extra, self.normalize]
-        )
-        self.global_transfo2 = A.Compose(
-            [color_jittering, global_transfo2_extra, self.normalize]
-        )
-        self.local_transfo = A.Compose(
-            [color_jittering, local_transfo_extra, self.normalize]
-        )
+        local_transfo_extra = A.GaussianBlur(blur_limit=23, sigma_limit=(0.1, 2.0), p=0.5)
+        self.normalize = A.Normalize(mean=cfg.normalization_mean, std=cfg.normalization_std)
+        self.global_transfo1 = A.Compose([color_jittering, global_transfo1_extra, self.normalize])
+        self.global_transfo2 = A.Compose([color_jittering, global_transfo2_extra, self.normalize])
+        self.local_transfo = A.Compose([color_jittering, local_transfo_extra, self.normalize])
 
     def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         image = element["image"]
@@ -151,9 +137,7 @@ def create_dataloaders(
     train_loader = grain.DataLoader(
         data_source=imagenet,
         operations=[
-            DINOAugmentations(cfg)
-            if train_augmentations
-            else DINOValidationAugmentations(cfg),
+            DINOAugmentations(cfg) if train_augmentations else DINOValidationAugmentations(cfg),
             grain.Batch(batch_size, drop_remainder=True),
         ],
         sampler=grain.IndexSampler(

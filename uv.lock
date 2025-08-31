@@ -254,7 +254,7 @@ wheels = [
 ]
 
 [[package]]
-name = "dino"
+name = "dino-jax"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -1,7 +1,7 @@
 [project]
-name = "dino"
+name = "dino-jax"
 version = "0.1.0"
-description = "Add your description here"
+description = "DINO (v1) re-implementation with Jax/Flax."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -22,3 +22,6 @@ dependencies = [
     "tyro>=0.9.28",
     "wandb>=0.21.1",
 ]
+
+[tool.ruff]
+line-length = 100

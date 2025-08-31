@@ -19,9 +19,7 @@ from model import SSLConfig, SSLDinoConfig, SSLTeacherStudent, ViT, ViTConfig, D
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update(
-    "jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir"
-)
+jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
 
 
 @dataclass
@@ -121,9 +119,7 @@ def knn_classifier(
         dist = jnp.exp(dist / temperature)
 
         probs = jax.vmap(
-            lambda labels, weights: jnp.bincount(
-                labels, weights=weights, length=num_classes
-            ),
+            lambda labels, weights: jnp.bincount(labels, weights=weights, length=num_classes),
             in_axes=(0, 0),
         )(train_labels[ids], dist)
         preds = jnp.argsort(probs, axis=1, descending=True)
@@ -162,20 +158,16 @@ def load_model(cfg: Config, mesh: jax.sharding.Mesh | None) -> ViT:
         raise ValueError(f"No checkpoint found in {cfg.ckpt}")
     print(f"Found checkpoint at step {step}")
 
-    ssl_cfg = mngr.restore(
-        step, args=ocp.args.Composite(config=ocp.args.JsonRestore())
-    )["config"]["ssl"]
-    ssl_cfg = SSLConfig(
-        dino=SSLDinoConfig(**ssl_cfg["dino"]), vit=ViTConfig(**ssl_cfg["vit"])
-    )
+    ssl_cfg = mngr.restore(step, args=ocp.args.Composite(config=ocp.args.JsonRestore()))["config"][
+        "ssl"
+    ]
+    ssl_cfg = SSLConfig(dino=SSLDinoConfig(**ssl_cfg["dino"]), vit=ViTConfig(**ssl_cfg["vit"]))
 
-    ssl = nnx.eval_shape(
-        lambda: SSLTeacherStudent(ssl_cfg, mesh=mesh, rngs=nnx.Rngs(0))
-    )
+    ssl = nnx.eval_shape(lambda: SSLTeacherStudent(ssl_cfg, mesh=mesh, rngs=nnx.Rngs(0)))
     graphdef, state = nnx.split(ssl)
-    state = mngr.restore(
-        step, args=ocp.args.Composite(state=ocp.args.StandardRestore(state))
-    )["state"]
+    state = mngr.restore(step, args=ocp.args.Composite(state=ocp.args.PyTreeRestore(state)))[
+        "state"
+    ]
     ssl = nnx.merge(graphdef, state)
     vit = ssl.teacher
     del ssl
