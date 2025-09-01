@@ -5,7 +5,6 @@ import os
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
-from jaxtyping import Array, Float, PyTree
 import flax.nnx as nnx
 import orbax.checkpoint as ocp
 import tyro
@@ -14,7 +13,7 @@ from grain.python import DataLoader
 
 from train import TrainConfig
 from data import DataConfig, create_dataloaders
-from model import SSLConfig, SSLDinoConfig, SSLTeacherStudent, ViT, ViTConfig, DINOHead
+from model import SSLConfig, SSLDinoConfig, SSLTeacherStudent, ViT, ViTConfig
 
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)

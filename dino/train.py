@@ -60,10 +60,12 @@ class Config:
     """The batch size for a singe gpu at a given time (micro_batch // n_gpus)"""
 
     wandb: bool = False
-    wandb_frequency: int = 4
-    """Only log the kth iteration. NOTE: it does not average the intermediate results"""
+    wandb_frequency: int = 20
+    """Only log the kth iteration. NOTE: it does not average the intermediate results."""
     experiment_name: str | None = None
     checkpoint: bool = True
+    num_checkpoints: int = 10
+    """Indicates how many checkpoints are to be created during the entirety of the training duration."""
     restore: Path | None = None
 
     train: TrainConfig = field(default_factory=lambda: TrainConfig())
@@ -106,14 +108,14 @@ def cosine_scheduler_jax(start: float, end: float, num_iter: int) -> Callable:
 
 
 def build_schedules(
-    cfg: TrainConfig, samples_per_epoch: int
+    cfg: TrainConfig, total_steps: int
 ) -> tuple[Callable, Callable, Callable, Callable]:
-    total_steps = cfg.epochs * samples_per_epoch
+    steps_per_epoch = total_steps // cfg.epochs
     lr_base_scaled = cfg.lr_base * (cfg.batch_size / 256.0)
     lr_schedule = warmup_cosine_decay_schedule(
         init_value=cfg.lr_final,
         peak_value=lr_base_scaled,
-        warmup_steps=cfg.lr_warmup_epochs * samples_per_epoch,
+        warmup_steps=cfg.lr_warmup_epochs * steps_per_epoch,
         decay_steps=total_steps,
         end_value=cfg.lr_final,
     )
@@ -124,7 +126,7 @@ def build_schedules(
     tt_schedule = cosine_scheduler(
         cfg.teacher_temp_start,
         cfg.teacher_temp_end,
-        cfg.teacher_temp_warmup_epochs * samples_per_epoch,
+        cfg.teacher_temp_warmup_epochs * steps_per_epoch,
     )
 
     return lr_schedule, wd_schedule, mo_schedule, tt_schedule
@@ -208,9 +210,8 @@ def restore_checkpoint(
 
     # Restore dataloader state
     loader = mngr.restore(step, args=Composite(loader=PyGrainCheckpointRestore(loader)))["loader"]
-    global_step = step * train_iters
 
-    return ssl, optim, loader, global_step
+    return ssl, optim, loader, step
 
 
 def main(cfg: Config):
@@ -227,17 +228,17 @@ def main(cfg: Config):
     print("grad_acc_steps: ", grad_acc_steps)
     print("micro_batch_size: ", micro_bs)
 
-    train_loader, _, train_iters, _ = create_dataloaders(cfg.data, micro_bs, cfg.train.epochs)
+    train_loader, _, total_train_iters, _ = create_dataloaders(cfg.data, micro_bs, cfg.train.epochs)
     data_iter = iter(train_loader)
 
     if cfg.restore is not None:
-        model, optim, data_iter, global_step = restore_checkpoint(
-            cfg.restore, cfg, data_iter, train_iters, grad_acc_steps, mesh=mesh
+        model, optim, data_iter, step = restore_checkpoint(
+            cfg.restore, cfg, data_iter, total_train_iters, grad_acc_steps, mesh=mesh
         )
     else:
         model = SSLTeacherStudent(cfg.ssl, mesh=mesh, rngs=rngs)
-        optim = create_optimizer(model, cfg.train, train_iters, grad_acc_steps)
-        global_step = 0
+        optim = create_optimizer(model, cfg.train, total_train_iters, grad_acc_steps)
+        step = 0
 
     model.train()
     student_params = jax.tree.leaves(nnx.state(model.student, nnx.Param))
@@ -247,16 +248,30 @@ def main(cfg: Config):
     print(f"ViT backbone: {param_count / 1_000_000:.2f}M params")
     print(f"ViT head: {head_param_count / 1_000_000:.2f}M params")
 
-    lr_schedule, wd_schedule, mo_schedule, tt_schedule = build_schedules(cfg.train, train_iters)
+    lr_schedule, wd_schedule, mo_schedule, tt_schedule = build_schedules(
+        cfg.train, total_train_iters
+    )
 
-    opts = ocp.CheckpointManagerOptions(max_to_keep=3, create=True, read_only=not cfg.checkpoint)
+    ckpt_interval = total_train_iters // (cfg.num_checkpoints - 1)
+    ckpt_steps = [i * ckpt_interval for i in range(1, cfg.num_checkpoints)]
+    ckpt_steps.append(total_train_iters)
+    opts = ocp.CheckpointManagerOptions(
+        max_to_keep=3,
+        create=True,
+        read_only=not cfg.checkpoint,
+    )
     ckpt_path = os.path.abspath(wandb.run.dir if cfg.wandb else Path("outputs"))
     mngr = ocp.CheckpointManager(
         ckpt_path, options=opts, item_names=("state", "optim", "loader", "config")
     )
 
-    epoch = 0
-    for samples in tqdm(range(global_step, train_iters * cfg.train.epochs), desc="Step"):
+    iters_per_epoch = total_train_iters // cfg.train.epochs  # This is an approximation
+    update_last_layer = lambda step: (step // iters_per_epoch >= cfg.train.freeze_last_layer_epochs)
+    for _ in tqdm(
+        range(step, total_train_iters),
+        desc="Step",
+        bar_format="{desc:<5.5}{percentage:3.0f}%|{bar:10}{r_bar}",
+    ):
         samples = next(data_iter)
         samples = jax.device_put(samples, NamedSharding(mesh, P("data", None, None, None)))
         loss = model(
@@ -264,40 +279,37 @@ def main(cfg: Config):
             samples["global_crops"],
             samples["local_crops"],
             student_temp=cfg.train.student_temp,
-            teacher_temp=tt_schedule(global_step),
-            update_last_layer=epoch >= cfg.train.freeze_last_layer_epochs,
+            teacher_temp=tt_schedule(step),
+            update_last_layer=update_last_layer(step),
         )
 
-        if global_step % grad_acc_steps == 0:
-            model.update_teacher(mo_schedule(global_step))
+        if (step + 1) % grad_acc_steps == 0:
+            model.update_teacher(mo_schedule(step))
 
-            if cfg.wandb and global_step % (grad_acc_steps * cfg.wandb_frequency) == 0:
+            if cfg.wandb and step % (grad_acc_steps * cfg.wandb_frequency) == 0:
                 wandb.log(
                     {
-                        "iter": global_step,
+                        "iter": step,
                         "loss": loss,
-                        "lr": lr_schedule(global_step),
-                        "wd": wd_schedule(global_step),
-                        "teacher_momentum": mo_schedule(global_step),
-                        "teacher_temp": tt_schedule(global_step),
+                        "lr": lr_schedule(step),
+                        "wd": wd_schedule(step),
+                        "teacher_momentum": mo_schedule(step),
+                        "teacher_temp": tt_schedule(step),
                     }
                 )
 
-        global_step += 1
-
-        if global_step % train_iters == 0:
-            epoch += 1
-            if cfg.checkpoint:
-                mngr.save(
-                    epoch,
-                    args=Composite(
-                        state=PyTreeSave(nnx.state(model)),
-                        optim=PyTreeSave(nnx.state(optim)),
-                        loader=PyGrainCheckpointSave(data_iter),
-                        config=JsonSave(asdict(cfg)),
-                    ),
-                )
-                mngr.wait_until_finished()
+        step += 1
+        if step in ckpt_steps:
+            mngr.save(
+                step,
+                args=Composite(
+                    state=PyTreeSave(nnx.state(model)),
+                    optim=PyTreeSave(nnx.state(optim)),
+                    loader=PyGrainCheckpointSave(data_iter),
+                    config=JsonSave(asdict(cfg)),
+                ),
+            )
+            mngr.wait_until_finished()
 
     mngr.close()
     if cfg.wandb:

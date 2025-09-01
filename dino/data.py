@@ -168,6 +168,6 @@ def create_dataloaders(
     return (
         train_loader,
         val_loader,
-        len(imagenet) // batch_size,
+        (len(imagenet) * epochs) // batch_size,
         (len(imagenet_val) + batch_size - 1) // batch_size,
     )
