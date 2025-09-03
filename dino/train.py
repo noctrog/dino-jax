@@ -228,7 +228,7 @@ def main(cfg: Config):
     print("grad_acc_steps: ", grad_acc_steps)
     print("micro_batch_size: ", micro_bs)
 
-    train_loader, _, total_train_iters, _ = create_dataloaders(cfg.data, micro_bs, cfg.train.epochs)
+    train_loader, total_train_iters = create_dataloaders(cfg.data, micro_bs, cfg.train.epochs)
     data_iter = iter(train_loader)
 
     if cfg.restore is not None:

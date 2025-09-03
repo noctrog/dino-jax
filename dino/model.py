@@ -1,4 +1,4 @@
-from typing import Tuple, Literal
+from typing import Literal
 from functools import partial
 from dataclasses import dataclass, field
 import math
@@ -155,7 +155,7 @@ class Attention(nnx.Module):
         q = rearrange(q, "b t (n c) -> b t n c", n=self.num_heads)
         k = rearrange(k, "b t (n c) -> b t n c", n=self.num_heads)
         v = rearrange(v, "b t (n c) -> b t n c", n=self.num_heads)
-        att = self.attn_fn(q, k, v, mask=attention_mask)
+        att = self.attn_fn(q, k, v, mask=attention_mask, implementation="cudnn")
         att = rearrange(att, "b t n c -> b t (n c)")
         att = self.o_proj(att)
         att = att.astype(jnp.float32)
@@ -208,10 +208,15 @@ class ViT(nnx.Module):
             pos_embed_init(pos_key, (1, self.patch_embed.num_patches + 1, cfg.embed_dim))
         )
 
-        drp = [i * cfg.drop_rate / (cfg.num_layers - 1) for i in range(cfg.num_layers)]
-        self.layers = [
-            TransformerDecoderLayer(cfg, drp[i], rngs=rngs) for i in range(cfg.num_layers)
-        ]
+        # TODO: add the drop rate into the transformer decoder layers
+        # drp = [i * cfg.drop_rate / (cfg.num_layers - 1) for i in range(cfg.num_layers)]
+        @nnx.split_rngs(splits=cfg.num_layers)
+        @nnx.vmap(axis_size=cfg.num_layers)
+        def create_block(rngs: nnx.Rngs):
+            return TransformerDecoderLayer(cfg, 0.0, rngs=rngs)
+
+        self.layers = create_block(rngs)
+
         self.norm = nnx.LayerNorm(
             cfg.embed_dim,
             scale_init=nnx.initializers.ones_init(),
@@ -257,9 +262,12 @@ class ViT(nnx.Module):
         tokens = jnp.concatenate(jax.tree.leaves(tokens), axis=1)
         attn_mask = jax.scipy.linalg.block_diag(*jax.tree.leaves(ones))
 
-        for block in self.layers:
-            tokens = block(tokens, attention_mask=attn_mask)
+        @partial(nnx.scan, unroll=True)
+        def block_scan(tokens_carry: jax.Array, layer: TransformerDecoderLayer):
+            new_tokens = layer(tokens_carry, attention_mask=attn_mask)
+            return new_tokens, None
 
+        tokens, _ = block_scan(tokens, self.layers)
         tokens = self.norm(tokens)
         starts = jnp.concatenate(
             (jnp.array([0]), jnp.cumsum(jnp.array(lens[:-1], dtype=jnp.int32)))

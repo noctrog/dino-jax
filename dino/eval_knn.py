@@ -182,7 +182,7 @@ def main(cfg: Config):
     vit = load_model(cfg, mesh)
 
     train_loader, val_loader, nb_train_iters, nb_val_iters = create_dataloaders(
-        cfg.data, batch_size, epochs=1, train_augmentations=False
+        cfg.data, batch_size, epochs=1, for_validation=True
     )
 
     train_features, train_labels = extract_features_and_labels(
