@@ -39,65 +39,60 @@ class DINOAugmentations(grain.MapTransform):
         super().__init__()
         self.local_crops_number = cfg.local_crops_number
 
-        flip_and_color_jitter = A.Compose(
+        self.geom_aug_global = A.Compose(
             [
+                A.RandomResizedCrop(
+                    cfg.global_crops_size,
+                    cfg.global_crops_scale,
+                    cfg.ratio,
+                    interpolation=cv2.INTER_CUBIC,
+                ),
                 A.HorizontalFlip(p=0.5),
+            ]
+        )
+        self.geom_aug_local = A.Compose(
+            [
+                A.RandomResizedCrop(
+                    cfg.local_crops_size,
+                    cfg.local_crops_scale,
+                    cfg.ratio,
+                    interpolation=cv2.INTER_CUBIC,
+                ),
+                A.HorizontalFlip(p=0.5),
+            ]
+        )
+        color_jittering = A.Compose(
+            [
                 A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
                 A.ToGray(p=0.2),
             ]
         )
-        normalize = A.Normalize(mean=cfg.normalization_mean, std=cfg.normalization_std)
-
-        self.global_transfo1 = A.Compose(
+        global_transfo1_extra = A.GaussianBlur(blur_limit=23, sigma_limit=(0.1, 2.0), p=1.0)
+        global_transfo2_extra = A.Compose(
             [
-                A.RandomResizedCrop(
-                    size=cfg.global_crops_size,
-                    scale=cfg.global_crops_scale,
-                    ratio=cfg.ratio,
-                    interpolation=cv2.INTER_CUBIC,
-                ),
-                flip_and_color_jitter,
-                A.GaussianBlur(blur_limit=23, sigma_limit=(0.1, 2.0), p=1.0),
-                normalize,
+                A.GaussianBlur(blur_limit=23, sigma_limit=(0.1, 2.0), p=0.1),
+                A.Solarize(threshold_range=(0.5, 0.5), p=0.2),
             ]
         )
 
-        self.global_transfo2 = A.Compose(
-            [
-                A.RandomResizedCrop(
-                    size=cfg.global_crops_size,
-                    scale=cfg.global_crops_scale,
-                    ratio=cfg.ratio,
-                    interpolation=cv2.INTER_CUBIC,
-                ),
-                flip_and_color_jitter,
-                A.GaussianBlur(blur_limit=0, sigma_limit=(0.1, 2.0), p=0.1),
-                A.Solarize(p=0.2),
-                normalize,
-            ]
-        )
-
-        self.local_transfo = A.Compose(
-            [
-                A.RandomResizedCrop(
-                    size=cfg.local_crops_size,
-                    scale=cfg.local_crops_scale,
-                    ratio=cfg.ratio,
-                    interpolation=cv2.INTER_CUBIC,
-                ),
-                flip_and_color_jitter,
-                A.GaussianBlur(blur_limit=0, sigma_limit=(0.1, 2.0), p=0.5),
-                normalize,
-            ]
-        )
+        local_transfo_extra = A.GaussianBlur(blur_limit=23, sigma_limit=(0.1, 2.0), p=0.5)
+        self.normalize = A.Normalize(mean=cfg.normalization_mean, std=cfg.normalization_std)
+        self.global_transfo1 = A.Compose([color_jittering, global_transfo1_extra, self.normalize])
+        self.global_transfo2 = A.Compose([color_jittering, global_transfo2_extra, self.normalize])
+        self.local_transfo = A.Compose([color_jittering, local_transfo_extra, self.normalize])
 
     def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         image = element["image"]
 
-        global_crop_1 = self.global_transfo1(image=image)["image"]
-        global_crop_2 = self.global_transfo2(image=image)["image"]
+        im1_base = self.geom_aug_global(image=image)["image"]
+        global_crop_1 = self.global_transfo1(image=im1_base)["image"]
+
+        im2_base = self.geom_aug_global(image=image)["image"]
+        global_crop_2 = self.global_transfo2(image=im2_base)["image"]
+
         local_crops = [
-            self.local_transfo(image=image)["image"] for _ in range(self.local_crops_number)
+            self.local_transfo(image=self.geom_aug_local(image=image)["image"])["image"]
+            for _ in range(self.local_crops_number)
         ]
 
         return {
