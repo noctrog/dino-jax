@@ -1,3 +1,4 @@
+from typing import Iterable
 from dataclasses import dataclass
 import platform
 import os
@@ -6,6 +7,8 @@ os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 os.environ["ALBUMENTATIONS_NO_TELEMETRY"] = "1"
 
 import numpy as np
+import jax
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
 import grain.python as grain
 import tensorflow_datasets as tfds
 import albumentations as A
@@ -174,3 +177,35 @@ def create_dataloaders(
             (len(imagenet) * epochs) // batch_size,
             (len(imagenet_val) + batch_size - 1) // batch_size,
         )
+
+
+class Prefetcher:
+    """Batch prefetcher. It asynchronously loads the next batch, hiding the
+    host->device latency.
+    """
+
+    def __init__(self, data_iterator: Iterable, mesh: Mesh):
+        self.data_iterator = data_iterator
+        self.sharding = NamedSharding(mesh, PartitionSpec("data", None, None, None))
+        self.next_batch = None
+        self._prefetch()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        current_batch = self.next_batch
+        if current_batch is None:
+            raise StopIteration
+        self._prefetch()
+        return current_batch
+
+    def _prefetch(self):
+        try:
+            next_batch_host = next(self.data_iterator)
+            self.next_batch = jax.device_put(next_batch_host, self.sharding)
+        except StopIteration:
+            self.next_batch = None
+
+    def get_underlying_iterator(self) -> grain.DatasetIterator:
+        return self.data_iterator

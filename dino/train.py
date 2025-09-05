@@ -18,7 +18,7 @@ import tyro
 from tqdm import tqdm
 import wandb
 
-from data import DataConfig, create_dataloaders
+from data import DataConfig, create_dataloaders, Prefetcher
 from model import SSLConfig, SSLTeacherStudent, SSLDinoConfig, ViTConfig
 
 
@@ -164,7 +164,7 @@ def create_optimizer(
 def restore_checkpoint(
     ckpt_path: Path,
     cfg: Config,
-    loader,
+    data_iter: Prefetcher,
     train_iters: int,
     grad_acc_steps: int,
     mesh: jax.sharding.Mesh | None,
@@ -209,9 +209,13 @@ def restore_checkpoint(
     nnx.update(optim, opt_state["optim"])
 
     # Restore dataloader state
+    loader = data_iter.get_underlying_iterator()
     loader = mngr.restore(step, args=Composite(loader=PyGrainCheckpointRestore(loader)))["loader"]
+    data_iter = Prefetcher(loader, mesh)
 
-    return ssl, optim, loader, step
+    # Set to none because the restore path cannot be checkpointed
+    cfg.restore = None
+    return ssl, optim, data_iter, step
 
 
 def main(cfg: Config):
@@ -229,7 +233,7 @@ def main(cfg: Config):
     print("micro_batch_size: ", micro_bs)
 
     train_loader, total_train_iters = create_dataloaders(cfg.data, micro_bs, cfg.train.epochs)
-    data_iter = iter(train_loader)
+    data_iter = Prefetcher(iter(train_loader), mesh)
 
     if cfg.restore is not None:
         model, optim, data_iter, step = restore_checkpoint(
@@ -267,13 +271,13 @@ def main(cfg: Config):
 
     iters_per_epoch = total_train_iters // cfg.train.epochs  # This is an approximation
     update_last_layer = lambda step: (step // iters_per_epoch >= cfg.train.freeze_last_layer_epochs)
-    for _ in tqdm(
-        range(step, total_train_iters),
+    for samples in tqdm(
+        data_iter,
         desc="Step",
+        initial=step,
+        total=total_train_iters,
         bar_format="{desc:<5.5}{percentage:3.0f}%|{bar:10}{r_bar}",
     ):
-        samples = next(data_iter)
-        samples = jax.device_put(samples, NamedSharding(mesh, P("data", None, None, None)))
         loss = model(
             optim,
             samples["global_crops"],
@@ -305,11 +309,14 @@ def main(cfg: Config):
                 args=Composite(
                     state=PyTreeSave(nnx.state(model)),
                     optim=PyTreeSave(nnx.state(optim)),
-                    loader=PyGrainCheckpointSave(data_iter),
+                    loader=PyGrainCheckpointSave(data_iter.get_underlying_iterator()),
                     config=JsonSave(asdict(cfg)),
                 ),
             )
             mngr.wait_until_finished()
+
+        if step == total_train_iters:
+            break
 
     mngr.close()
     if cfg.wandb:
