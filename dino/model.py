@@ -210,12 +210,8 @@ class ViT(nnx.Module):
 
         # TODO: add the drop rate into the transformer decoder layers
         # drp = [i * cfg.drop_rate / (cfg.num_layers - 1) for i in range(cfg.num_layers)]
-        @nnx.split_rngs(splits=cfg.num_layers)
-        @nnx.vmap(axis_size=cfg.num_layers)
-        def create_block(rngs: nnx.Rngs):
-            return TransformerDecoderLayer(cfg, 0.0, rngs=rngs)
 
-        self.layers = create_block(rngs)
+        self.layers = [TransformerDecoderLayer(cfg, 0.0, rngs=rngs) for _ in range(cfg.num_layers)]
 
         self.norm = nnx.LayerNorm(
             cfg.embed_dim,
@@ -262,12 +258,9 @@ class ViT(nnx.Module):
         tokens = jnp.concatenate(jax.tree.leaves(tokens), axis=1)
         attn_mask = jax.scipy.linalg.block_diag(*jax.tree.leaves(ones))
 
-        @partial(nnx.scan, unroll=True)
-        def block_scan(tokens_carry: jax.Array, layer: TransformerDecoderLayer):
-            new_tokens = layer(tokens_carry, attention_mask=attn_mask)
-            return new_tokens, None
+        for block in self.layers:
+            tokens = block(tokens, attention_mask=attn_mask)
 
-        tokens, _ = block_scan(tokens, self.layers)
         tokens = self.norm(tokens)
         starts = jnp.concatenate(
             (jnp.array([0]), jnp.cumsum(jnp.array(lens[:-1], dtype=jnp.int32)))
