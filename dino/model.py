@@ -405,25 +405,19 @@ class DINOLoss(nnx.Module):
         student_temp: float,
         teacher_temp: float,
     ) -> tuple[float | jax.Array, jax.Array]:
-        student_logprob = jax.tree.map(
-            lambda x: jax.nn.log_softmax(x / student_temp, axis=-1), student_logits
-        )
-        teacher_probs = jax.tree.map(
-            lambda x: jax.nn.softmax((x - self.center) / teacher_temp, axis=-1),
-            teacher_logits,
-        )
-        n_terms = 0
-        total_loss = 0
-        for i_s in range(student_logprob.shape[1]):
-            for i_t in range(teacher_probs.shape[1]):
-                if i_s == i_t:
-                    continue
-                lsm, t = student_logprob[:, i_s], teacher_probs[:, i_t]
-                total_loss -= jnp.sum(t * lsm, axis=-1).mean()
-                n_terms += 1
+        S, T = student_logits.shape[1], teacher_logits.shape[1]
+        student_logprob = jax.nn.log_softmax(student_logits / student_temp, axis=-1)
+        teacher_probs = jax.nn.softmax((teacher_logits - self.center) / teacher_temp, axis=-1)
+
+        student_logprob = student_logprob[:, :, None, :]  # BS1L
+        teacher_probs = teacher_probs[:, None, :, :]  # B1TL
+
+        mask = jnp.ones((S, T), dtype=jnp.bool_).at[jnp.arange(T), jnp.arange(T)].set(False)
+        batch_loss = -jnp.sum(teacher_probs * student_logprob, axis=-1).mean(axis=0) * mask  # ST
+        n_terms = (S - 1) * T
 
         new_center = self.update_center(teacher_logits)
-        return total_loss / n_terms, new_center
+        return jnp.sum(batch_loss) / n_terms, new_center
 
     def update_center(self, teacher_output: jax.Array):
         def compute_global_center(teacher_output: jax.Array) -> jax.Array:
