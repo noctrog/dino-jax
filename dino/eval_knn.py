@@ -111,7 +111,6 @@ def knn_classifier(
 ) -> tuple[float, float]:
     num_val_chunks = (val_labels.shape[0] + val_chunk_size - 1) // val_chunk_size
 
-    # @jax.jit
     def inner_loop_step(features: jax.Array, targets: jax.Array):
         similarity = jnp.matmul(features, train_features.T)
         dist, ids = jax.lax.top_k(similarity, k=k)
