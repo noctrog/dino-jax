@@ -18,7 +18,7 @@ class ViTConfig:
 
     configuration: Literal["vitt", "vits", "vitb", "vitl"] = "vits"
 
-    drop_rate: float = 0.0
+    drop_rate: float = 0.1
 
     selective: bool = False
     """If True, checkpoint the attention computations for the backward pass."""
@@ -61,27 +61,59 @@ class SSLConfig:
 class DropPath(nnx.Module):
     def __init__(
         self,
-        drop_prob: float,
+        rate: float,
         deterministic: bool = False,
         rng_collection: str = "dropout",
         *,
-        rngs: nnx.Rngs,
+        rngs: nnx.Rngs | nnx.RngStream | None = None,
     ):
-        self.drop_prob = drop_prob
+        self.rate = rate
         self.deterministic = deterministic
-        self.rng_collection = "dropout"
-        self.rngs = rngs[self.rng_collection].fork()
+        self.rng_collection = rng_collection
 
-    def __call__(self, x: jax.Array, deterministic: bool | None = None):
-        det = deterministic if deterministic is not None else self.deterministic
-        if self.drop_prob == 0.0 or det:
-            return x
+        if isinstance(rngs, nnx.Rngs):
+            self.rngs = rngs[self.rng_collection].fork()
+        elif isinstance(rngs, nnx.RngStream):
+            self.rngs = rngs.fork()
+        elif rngs is None:
+            self.rngs = None
         else:
-            keep_prob = 1 - self.drop_prob
-            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-            mask = jax.random.bernoulli(self.rngs(), p=keep_prob, shape=shape)
-            mask = jnp.broadcast_to(mask, x.shape)
-            return jax.lax.select(mask, x / keep_prob, jnp.zeros_like(x))
+            raise TypeError(f"rngs must be a Rngs, RngStream or None, but got {type(rngs)}")
+
+    def __call__(
+        self,
+        x: jax.Array,
+        *,
+        deterministic: bool | None = None,
+        rngs: nnx.Rngs | nnx.RngStream | jax.Array | None = None,
+    ):
+        det = deterministic if deterministic is not None else self.deterministic
+        if self.rate == 0.0 or det:
+            return x
+
+        if self.rate == 1.0:
+            return jnp.zeros_like(x)
+
+        if rngs is None and self.rngs is None:
+            raise ValueError(
+                "`deterministic` is False, but no `rngs` argument was provided to DropPath"
+            )
+        rngs = rngs if rngs is not None else self.rngs
+
+        if isinstance(rngs, nnx.Rngs):
+            key = rngs[self.rng_collection]()
+        elif isinstance(rngs, nnx.RngStream):
+            key = rngs()
+        elif isinstance(rngs, jax.Array):
+            key = rngs
+        else:
+            raise TypeError(f"rngs must be a Rngs, RngStream or jax.Array, but got {type(rngs)}")
+
+        keep_prob = 1 - self.rate
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = jax.random.bernoulli(key, p=keep_prob, shape=shape)
+        mask = jnp.broadcast_to(mask, x.shape)
+        return jax.lax.select(mask, x / keep_prob, jnp.zeros_like(x))
 
 
 class PatchEmbed(nnx.Module):
@@ -150,11 +182,9 @@ class Attention(nnx.Module):
 
     def __call__(self, x: jax.Array, attention_mask: jax.Array | None = None) -> jax.Array:
         x = x.astype(jnp.bfloat16)
-        q, k, v = jnp.split(self.qkv_proj(x), 3, axis=-1)
+        qkv = self.qkv_proj(x)
+        q, k, v = rearrange(qkv, "b t (three n c) -> three b t n c", three=3, n=self.num_heads)
 
-        q = rearrange(q, "b t (n c) -> b t n c", n=self.num_heads)
-        k = rearrange(k, "b t (n c) -> b t n c", n=self.num_heads)
-        v = rearrange(v, "b t (n c) -> b t n c", n=self.num_heads)
         att = self.attn_fn(q, k, v, mask=attention_mask, implementation="cudnn")
         att = rearrange(att, "b t n c -> b t (n c)")
         att = self.o_proj(att)
@@ -186,10 +216,12 @@ class TransformerDecoderLayer(nnx.Module):
         self,
         x: jax.Array,
         attention_mask: jax.Array | None = None,
+        *,
+        deterministic: bool | None = None,
     ) -> jax.Array:
         attn = self.attention(self.att_norm(x), attention_mask)
-        x = x + self.drop_path(attn)
-        x = x + self.drop_path(self.mlp(self.mlp_norm(x)))
+        x = x + self.drop_path(attn, deterministic=deterministic)
+        x = x + self.drop_path(self.mlp(self.mlp_norm(x)), deterministic=deterministic)
         return x
 
 
@@ -208,10 +240,10 @@ class ViT(nnx.Module):
             pos_embed_init(pos_key, (1, self.patch_embed.num_patches + 1, cfg.embed_dim))
         )
 
-        # TODO: add the drop rate into the transformer decoder layers
-        # drp = [i * cfg.drop_rate / (cfg.num_layers - 1) for i in range(cfg.num_layers)]
-
-        self.layers = [TransformerDecoderLayer(cfg, 0.0, rngs=rngs) for _ in range(cfg.num_layers)]
+        drp = [i * cfg.drop_rate / (cfg.num_layers - 1) for i in range(cfg.num_layers)]
+        self.layers = [
+            TransformerDecoderLayer(cfg, drp[i], rngs=rngs) for i in range(cfg.num_layers)
+        ]
 
         self.norm = nnx.LayerNorm(
             cfg.embed_dim,
@@ -240,7 +272,9 @@ class ViT(nnx.Module):
         )
         return rearrange(pos_embed_resized, "b h w d -> b (h w) d")
 
-    def __call__(self, x: jax.Array | list[jax.Array]) -> dict[str, jax.Array]:
+    def __call__(
+        self, x: jax.Array | list[jax.Array], *, deterministic: bool | None = None
+    ) -> dict[str, jax.Array]:
         """Forward pass of the ViT.
 
         Args:
@@ -259,7 +293,7 @@ class ViT(nnx.Module):
         attn_mask = jax.scipy.linalg.block_diag(*jax.tree.leaves(ones))
 
         for block in self.layers:
-            tokens = block(tokens, attention_mask=attn_mask)
+            tokens = block(tokens, attention_mask=attn_mask, deterministic=deterministic)
 
         tokens = self.norm(tokens)
         starts = jnp.concatenate(
@@ -278,61 +312,31 @@ def _build_mlp(
     bias: bool = True,
     rngs: nnx.Rngs,
 ) -> nnx.Module:
+    linear_kwargs = {
+        "use_bias": bias,
+        "kernel_init": nnx.initializers.truncated_normal(0.02),
+        "bias_init": nnx.initializers.zeros_init(),
+        "dtype": jnp.bfloat16,
+        "param_dtype": jnp.float32,
+    }
     if nlayers == 1:
         return nnx.Linear(
             in_dim,
             bottleneck_dim,
-            use_bias=bias,
-            kernel_init=nnx.initializers.truncated_normal(0.02),
-            bias_init=nnx.initializers.zeros_init(),
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
             rngs=rngs,
+            **linear_kwargs,
         )
     else:
-        layers = [
-            nnx.Linear(
-                in_dim,
-                hidden_dim,
-                use_bias=bias,
-                kernel_init=nnx.initializers.truncated_normal(0.02),
-                bias_init=nnx.initializers.zeros_init(),
-                dtype=jnp.bfloat16,
-                param_dtype=jnp.float32,
-                rngs=rngs,
-            )
-        ]
+        layers = [nnx.Linear(in_dim, hidden_dim, rngs=rngs, **linear_kwargs)]
         if use_bn:
             layers.append(nnx.BatchNorm(hidden_dim, rngs=rngs))
         layers.append(nnx.gelu)
         for _ in range(nlayers - 2):
-            layers.append(
-                nnx.Linear(
-                    hidden_dim,
-                    hidden_dim,
-                    use_bias=bias,
-                    kernel_init=nnx.initializers.truncated_normal(0.02),
-                    bias_init=nnx.initializers.zeros_init(),
-                    dtype=jnp.bfloat16,
-                    param_dtype=jnp.float32,
-                    rngs=rngs,
-                )
-            )
+            layers.append(nnx.Linear(hidden_dim, hidden_dim, rngs=rngs, **linear_kwargs))
             if use_bn:
                 layers.append(nnx.BatchNorm(hidden_dim, rngs=rngs))
             layers.append(nnx.gelu)
-        layers.append(
-            nnx.Linear(
-                hidden_dim,
-                bottleneck_dim,
-                kernel_init=nnx.initializers.truncated_normal(0.02),
-                bias_init=nnx.initializers.zeros_init(),
-                use_bias=bias,
-                dtype=jnp.bfloat16,
-                param_dtype=jnp.float32,
-                rngs=rngs,
-            )
-        )
+        layers.append(nnx.Linear(hidden_dim, bottleneck_dim, rngs=rngs, **linear_kwargs))
         return nnx.Sequential(*layers)
 
 
@@ -452,9 +456,9 @@ def loss_fn(
     teacher_temp: float,
 ):
     """Returns the loss and the center update"""
-    teacher_output = teacher_vit(global_crops)
+    teacher_output = teacher_vit(global_crops, deterministic=True)
     teacher_logits = teacher_head(teacher_output["cls"])
-    student_output = student_vit(global_crops + local_crops)
+    student_output = student_vit(global_crops + local_crops, deterministic=False)
     student_logits = student_head(student_output["cls"])
     return dino_loss(
         student_logits=student_logits,

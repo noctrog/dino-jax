@@ -21,6 +21,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "tyro>=0.9.28",
     "wandb>=0.21.1",
+    "xprof>=2.20.6",
 ]
 
 [tool.ruff]

@@ -157,10 +157,10 @@ def load_model(cfg: Config, mesh: jax.sharding.Mesh | None) -> ViT:
         raise ValueError(f"No checkpoint found in {cfg.ckpt}")
     print(f"Found checkpoint at step {step}")
 
-    ssl_cfg = mngr.restore(step, args=ocp.args.Composite(config=ocp.args.JsonRestore()))["config"][
-        "ssl"
-    ]
+    ckpt_cfg = mngr.restore(step, args=ocp.args.Composite(config=ocp.args.JsonRestore()))["config"]
+    ssl_cfg = ckpt_cfg["ssl"]
     ssl_cfg = SSLConfig(dino=SSLDinoConfig(**ssl_cfg["dino"]), vit=ViTConfig(**ssl_cfg["vit"]))
+    cfg.data = DataConfig(**ckpt_cfg["data"])
 
     ssl = nnx.eval_shape(lambda: SSLTeacherStudent(ssl_cfg, mesh=mesh, rngs=nnx.Rngs(0)))
     graphdef, state = nnx.split(ssl)
