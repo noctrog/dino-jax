@@ -17,6 +17,7 @@ class ViTConfig:
     in_channels: int = 3
 
     configuration: Literal["vitt", "vits", "vitb", "vitl"] = "vits"
+    num_registers: int = 0
 
     drop_rate: float = 0.1
 
@@ -229,16 +230,17 @@ class ViT(nnx.Module):
     def __init__(self, cfg: ViTConfig, rngs: nnx.Rngs):
         self.embed_dim = cfg.embed_dim
         self.patch_embed = PatchEmbed(cfg, rngs)
+        num_patches = self.patch_embed.num_patches
+        self.num_registers = cfg.num_registers
 
         pos_embed_init = nnx.initializers.truncated_normal(0.02)
         cls_kernel_init = nnx.initializers.truncated_normal(0.02)
         init_key = rngs.params()
 
-        cls_key, pos_key = jax.random.split(init_key)
+        cls_key, pos_key, reg_key = jax.random.split(init_key, 3)
         self.cls_token = nnx.Param(cls_kernel_init(cls_key, (1, 1, cfg.embed_dim)))
-        self.pos_embed = nnx.Param(
-            pos_embed_init(pos_key, (1, self.patch_embed.num_patches + 1, cfg.embed_dim))
-        )
+        self.reg_tokens = nnx.Param(cls_kernel_init(reg_key, (1, cfg.num_registers, cfg.embed_dim)))
+        self.pos_embed = nnx.Param(pos_embed_init(pos_key, (1, num_patches, cfg.embed_dim)))
 
         drp = [i * cfg.drop_rate / (cfg.num_layers - 1) for i in range(cfg.num_layers)]
         self.layers = [
@@ -257,13 +259,13 @@ class ViT(nnx.Module):
         assert x.ndim == 3
         hw = math.isqrt(x.shape[1])
         assert hw**2 == x.shape[1]
-        hw_posemb = math.isqrt(self.pos_embed.shape[1] - 1)
-        assert hw_posemb**2 == self.pos_embed.shape[1] - 1
+        hw_posemb = math.isqrt(self.pos_embed.shape[1])
+        assert hw_posemb**2 == self.pos_embed.shape[1]
 
-        if x.shape[1] == self.pos_embed.shape[1] - 1:
-            return self.pos_embed[:, 1:]
+        if x.shape[1] == self.pos_embed.shape[1]:
+            return self.pos_embed
 
-        pos_embed_2d = rearrange(self.pos_embed[:, 1:], "b (h w) d -> b h w d", h=hw_posemb)
+        pos_embed_2d = rearrange(self.pos_embed.value, "b (h w) d -> b h w d", h=hw_posemb)
         pos_embed_resized = jax.image.resize(
             pos_embed_2d,
             shape=(1, hw, hw, self.embed_dim),
@@ -283,9 +285,10 @@ class ViT(nnx.Module):
         bs = x.shape[0] if isinstance(x, jax.Array) else x[0].shape[0]
         tokens = jax.tree.map(self.patch_embed, x)
         pos_embeds = jax.tree.map(self.interpolate_pos_encoding, tokens)
-        cls_token = jnp.broadcast_to(self.cls_token + self.pos_embed[:, 0], (bs, 1, self.embed_dim))
+        cls_token = jnp.broadcast_to(self.cls_token, (bs, 1, self.embed_dim))
+        reg_tokens = jnp.broadcast_to(self.reg_tokens, (bs, self.num_registers, self.embed_dim))
         tokens = jax.tree.map(
-            lambda x, p: jnp.concatenate((cls_token, x + p), axis=1), tokens, pos_embeds
+            lambda x, p: jnp.concatenate((cls_token, reg_tokens, x + p), axis=1), tokens, pos_embeds
         )
         lens = jax.tree.leaves(jax.tree.map(lambda x: x.shape[1], tokens))
         ones = jax.tree.map(lambda x: jnp.ones((x.shape[1], x.shape[1]), dtype=jnp.bool_), tokens)
@@ -296,10 +299,12 @@ class ViT(nnx.Module):
             tokens = block(tokens, attention_mask=attn_mask, deterministic=deterministic)
 
         tokens = self.norm(tokens)
-        starts = jnp.concatenate(
-            (jnp.array([0]), jnp.cumsum(jnp.array(lens[:-1], dtype=jnp.int32)))
-        )
-        return {"cls": tokens[:, starts, :]}
+        starts = jnp.concatenate((jnp.array([0]), jnp.cumsum(jnp.array(lens, dtype=jnp.int32))))
+        reg_ids = starts[:-1, None] + jnp.arange(1, self.num_registers)[None, :]
+        return {
+            "cls": tokens[:, starts[:-1], :],  # (B, N)
+            "registers": tokens[:, reg_ids, :],  # (B, N, R)
+        }
 
 
 def _build_mlp(
