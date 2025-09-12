@@ -48,7 +48,7 @@ class DINOAugmentations(grain.MapTransform):
                     cfg.global_crops_size,
                     cfg.global_crops_scale,
                     cfg.ratio,
-                    interpolation=cv2.INTER_CUBIC,
+                    interpolation=cv2.INTER_AREA,
                 ),
                 A.HorizontalFlip(p=0.5),
             ]
@@ -59,7 +59,7 @@ class DINOAugmentations(grain.MapTransform):
                     cfg.local_crops_size,
                     cfg.local_crops_scale,
                     cfg.ratio,
-                    interpolation=cv2.INTER_CUBIC,
+                    interpolation=cv2.INTER_AREA,
                 ),
                 A.HorizontalFlip(p=0.5),
             ]
