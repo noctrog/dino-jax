@@ -231,7 +231,7 @@ class ViT(nnx.Module):
         self.embed_dim = cfg.embed_dim
         self.patch_embed = PatchEmbed(cfg, rngs)
         num_patches = self.patch_embed.num_patches
-        self.num_registers = cfg.num_registers
+        self.num_reg = cfg.num_registers
 
         pos_embed_init = nnx.initializers.truncated_normal(0.02)
         cls_kernel_init = nnx.initializers.truncated_normal(0.02)
@@ -239,7 +239,11 @@ class ViT(nnx.Module):
 
         cls_key, pos_key, reg_key = jax.random.split(init_key, 3)
         self.cls_token = nnx.Param(cls_kernel_init(cls_key, (1, 1, cfg.embed_dim)))
-        self.reg_tokens = nnx.Param(cls_kernel_init(reg_key, (1, cfg.num_registers, cfg.embed_dim)))
+        # orbax does not support the saving of arrays with zero size, so we need to handle this
+        if self.num_reg > 0:
+            self.reg_tok = nnx.Param(cls_kernel_init(reg_key, (1, self.num_reg, cfg.embed_dim)))
+        else:
+            self.reg_tok = None
         self.pos_embed = nnx.Param(pos_embed_init(pos_key, (1, num_patches, cfg.embed_dim)))
 
         drp = [i * cfg.drop_rate / (cfg.num_layers - 1) for i in range(cfg.num_layers)]
@@ -286,10 +290,18 @@ class ViT(nnx.Module):
         tokens = jax.tree.map(self.patch_embed, x)
         pos_embeds = jax.tree.map(self.interpolate_pos_encoding, tokens)
         cls_token = jnp.broadcast_to(self.cls_token, (bs, 1, self.embed_dim))
-        reg_tokens = jnp.broadcast_to(self.reg_tokens, (bs, self.num_registers, self.embed_dim))
-        tokens = jax.tree.map(
-            lambda x, p: jnp.concatenate((cls_token, reg_tokens, x + p), axis=1), tokens, pos_embeds
-        )
+        if self.num_reg > 0:
+            reg_tokens = jnp.broadcast_to(self.reg_tok, (bs, self.num_reg, self.embed_dim))
+            tokens = jax.tree.map(
+                lambda x, p: jnp.concatenate((cls_token, reg_tokens, x + p), axis=1),
+                tokens,
+                pos_embeds,
+            )
+        else:
+            tokens = jax.tree.map(
+                lambda x, p: jnp.concatenate((cls_token, x + p), axis=1), tokens, pos_embeds
+            )
+
         lens = jax.tree.leaves(jax.tree.map(lambda x: x.shape[1], tokens))
         ones = jax.tree.map(lambda x: jnp.ones((x.shape[1], x.shape[1]), dtype=jnp.bool_), tokens)
         tokens = jnp.concatenate(jax.tree.leaves(tokens), axis=1)
@@ -300,7 +312,7 @@ class ViT(nnx.Module):
 
         tokens = self.norm(tokens)
         starts = jnp.concatenate((jnp.array([0]), jnp.cumsum(jnp.array(lens, dtype=jnp.int32))))
-        reg_ids = starts[:-1, None] + jnp.arange(1, self.num_registers)[None, :]
+        reg_ids = starts[:-1, None] + jnp.arange(1, self.num_reg)[None, :]
         return {
             "cls": tokens[:, starts[:-1], :],  # (B, N)
             "registers": tokens[:, reg_ids, :],  # (B, N, R)
