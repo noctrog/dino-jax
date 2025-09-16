@@ -395,7 +395,7 @@ class DINOLoss(nnx.Module):
         mesh: jax.sharding.Mesh | None,
     ):
         self.center_momentum = center_momentum
-        self.center = nnx.Variable(jnp.zeros((1, out_dim)))
+        self.center = nnx.Variable(jnp.zeros((1, 256, 256)))
         self.updated = True
         self.reduce_handle = None
         self.len_teacher_output = None
@@ -409,15 +409,17 @@ class DINOLoss(nnx.Module):
         student_temp: float,
         teacher_temp: float,
     ) -> tuple[float | jax.Array, jax.Array]:
+        student_logits = rearrange(student_logits, "b s (n l) -> b s 1 n l", n=256, l=256)
+        teacher_logits = rearrange(teacher_logits, "b t (n l) -> b 1 t n l", n=256, l=256)
+
         S, T = student_logits.shape[1], teacher_logits.shape[1]
         student_logprob = jax.nn.log_softmax(student_logits / student_temp, axis=-1)
         teacher_probs = jax.nn.softmax((teacher_logits - self.center) / teacher_temp, axis=-1)
 
-        student_logprob = student_logprob[:, :, None, :]  # BS1L
-        teacher_probs = teacher_probs[:, None, :, :]  # B1TL
-
         mask = jnp.ones((S, T), dtype=jnp.bool_).at[jnp.arange(T), jnp.arange(T)].set(False)
-        batch_loss = -jnp.sum(teacher_probs * student_logprob, axis=-1).mean(axis=0) * mask  # ST
+        batch_loss = (
+            -jnp.sum(teacher_probs * student_logprob, axis=(-1, -2)).mean(axis=0) * mask
+        )  # ST
         n_terms = (S - 1) * T
 
         new_center = self.update_center(teacher_logits)
@@ -425,7 +427,7 @@ class DINOLoss(nnx.Module):
 
     def update_center(self, teacher_output: jax.Array):
         def compute_global_center(teacher_output: jax.Array) -> jax.Array:
-            teacher_output = teacher_output.reshape(-1, teacher_output.shape[-1])
+            teacher_output = teacher_output.reshape(-1, 256, 256)
             batch_center = jnp.sum(teacher_output, axis=0, keepdims=True)
             global_center = jax.lax.psum(batch_center, axis_name="data")
             total_samples = jax.lax.psum(teacher_output.shape[0], axis_name="data")
@@ -434,8 +436,8 @@ class DINOLoss(nnx.Module):
         sharded_compute = jax.shard_map(
             compute_global_center,
             mesh=self.mesh,
-            in_specs=P("data", None, None),
-            out_specs=P(None, None),
+            in_specs=P("data", None, None, None),
+            out_specs=P(None, None, None),
         )
 
         global_center = sharded_compute(teacher_output)
